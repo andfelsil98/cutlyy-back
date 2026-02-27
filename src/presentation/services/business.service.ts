@@ -80,6 +80,7 @@ export class BusinessService {
         name: dto.name,
         type: dto.type,
         slug: dto.slug,
+        employees: [] as string[],
         logoUrl: dto.logoUrl ?? "",
         status: "ACTIVE" as const,
         createdAt: FirestoreDataBase.generateTimeStamp(),

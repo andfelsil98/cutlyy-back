@@ -1,5 +1,6 @@
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
 import { CustomError } from "../../domain/errors/custom-error";
+import type { Business } from "../../domain/interfaces/business.interface";
 import type { BusinessMembership } from "../../domain/interfaces/business-membership.interface";
 import type { Role } from "../../domain/interfaces/role.interface";
 import type { User } from "../../domain/interfaces/user.interface";
@@ -14,6 +15,7 @@ import { RoleService } from "./role.service";
 import { UserService } from "./user.service";
 
 const COLLECTION_NAME = "BusinessMemberships";
+const BUSINESSES_COLLECTION = "Businesses";
 const ROLE_COLLECTION = "Roles";
 const USER_COLLECTION = "Users";
 const ROOT_SUPER_ADMIN_ID = "WyeIL50oCUFg9PBvB9m9";
@@ -320,10 +322,37 @@ export class BusinessMembershipService {
         );
       }
 
-      await FirestoreService.update(COLLECTION_NAME, id, {
-        isEmployee: !membership.isEmployee,
-        updatedAt: FirestoreDataBase.generateTimeStamp(),
+      const nextIsEmployee = !membership.isEmployee;
+      const userDocument = await this.resolveMembershipUserDocument(membership.userId);
+
+      if (nextIsEmployee && membership.status !== "ACTIVE") {
+        throw CustomError.badRequest(
+          "Solo se puede marcar como empleado una membresía ACTIVE"
+        );
+      }
+
+      const business = await FirestoreService.getById<Business>(
+        BUSINESSES_COLLECTION,
+        membership.businessId
+      );
+      const nextEmployees = this.buildNextEmployeesList(
+        business.employees,
+        userDocument,
+        nextIsEmployee
+      );
+      const updatedAt = FirestoreDataBase.generateTimeStamp();
+
+      const db = FirestoreDataBase.getDB();
+      const batch = db.batch();
+      batch.update(db.collection(COLLECTION_NAME).doc(id), {
+        isEmployee: nextIsEmployee,
+        updatedAt,
       });
+      batch.update(db.collection(BUSINESSES_COLLECTION).doc(membership.businessId), {
+        employees: nextEmployees,
+        updatedAt,
+      });
+      await batch.commit();
 
       return await this.getMembershipById(id);
     } catch (error) {
@@ -442,5 +471,60 @@ export class BusinessMembershipService {
       ...membership,
       isEmployee: membership.isEmployee === true,
     };
+  }
+
+  private async resolveMembershipUserDocument(membershipUserId: string): Promise<string> {
+    const normalizedMembershipUserId = membershipUserId.trim();
+    if (normalizedMembershipUserId === "") {
+      throw CustomError.badRequest("La membresía no tiene un userId válido");
+    }
+
+    let user: User | null = null;
+
+    if (this.userService) {
+      user = await this.userService.getByDocument(normalizedMembershipUserId);
+      if (!user) {
+        user = await this.userService.getById(normalizedMembershipUserId);
+      }
+    }
+
+    if (!user) {
+      const [usersByDocument, usersById] = await Promise.all([
+        FirestoreService.getAll<User>(USER_COLLECTION, [
+          { field: "document", operator: "==", value: normalizedMembershipUserId },
+        ]),
+        FirestoreService.getAll<User>(USER_COLLECTION, [
+          { field: "id", operator: "==", value: normalizedMembershipUserId },
+        ]),
+      ]);
+      user = usersByDocument[0] ?? usersById[0] ?? null;
+    }
+
+    if (!user || user.document.trim() === "") {
+      throw CustomError.notFound(
+        "No existe un usuario válido para la membresía que se intenta modificar"
+      );
+    }
+
+    return user.document.trim();
+  }
+
+  private buildNextEmployeesList(
+    currentEmployees: string[] | undefined,
+    userDocument: string,
+    shouldInclude: boolean
+  ): string[] {
+    const normalizedCurrentEmployees = (currentEmployees ?? [])
+      .map((employeeDocument) => employeeDocument.trim())
+      .filter((employeeDocument) => employeeDocument !== "");
+    const employeesSet = new Set(normalizedCurrentEmployees);
+
+    if (shouldInclude) {
+      employeesSet.add(userDocument);
+    } else {
+      employeesSet.delete(userDocument);
+    }
+
+    return Array.from(employeesSet);
   }
 }

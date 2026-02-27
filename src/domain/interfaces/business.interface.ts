@@ -7,6 +7,7 @@ export interface Business {
   type: "BARBERSHOP" | "HAIRSALON" | "BEAUTYSALON";
   status: "ACTIVE" | "INACTIVE" | "PENDING" | "DELETED";
   slug: string;
+  employees: string[];
   logoUrl?: string;
   createdAt: string;
   updatedAt?: string;
