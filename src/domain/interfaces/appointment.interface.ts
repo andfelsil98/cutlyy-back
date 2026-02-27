@@ -14,6 +14,7 @@ export interface Appointment {
   id: string;
   businessId: string;
   branchId: string;
+  date: string;
   services: AppointmentServiceSelection[];
   employeeId?: string;
   clientId: string;

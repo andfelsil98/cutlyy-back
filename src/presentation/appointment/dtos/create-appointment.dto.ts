@@ -5,31 +5,50 @@ import type { AppointmentServiceSelection } from "../../../domain/interfaces/app
 export interface CreateAppointmentDto {
   businessId: string;
   branchId: string;
+  date: string;
   services: AppointmentServiceSelection[];
   employeeId?: string;
   clientId: string;
 }
 
-function parseIsoDateTimeOrThrow(
+function parseIsoDateOrThrow(
+  rawValue: string,
+  fieldPath: string
+): string {
+  const value = normalizeSpaces(rawValue);
+  const isoDateRegex = /^\d{4}-\d{2}-\d{2}$/;
+
+  if (!isoDateRegex.test(value)) {
+    throw CustomError.badRequest(
+      `${fieldPath} debe tener formato de fecha ISO 8601 (ej: 2026-03-10)`
+    );
+  }
+
+  const millis = Date.parse(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(millis)) {
+    throw CustomError.badRequest(`${fieldPath} debe ser una fecha válida`);
+  }
+
+  return value;
+}
+
+function parseTimeOrThrow(
   rawValue: string,
   fieldPath: string
 ): { value: string; millis: number } {
   const value = normalizeSpaces(rawValue);
-  const isoDateTimeRegex =
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})?$/;
+  const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
-  if (!isoDateTimeRegex.test(value)) {
+  const match = value.match(timeRegex);
+  if (!match) {
     throw CustomError.badRequest(
-      `${fieldPath} debe tener formato de fecha y hora ISO 8601 (ej: 2026-03-10T09:00:00Z)`
+      `${fieldPath} debe tener formato de hora HH:mm (ej: 09:00)`
     );
   }
 
-  const millis = Date.parse(value);
-  if (Number.isNaN(millis)) {
-    throw CustomError.badRequest(
-      `${fieldPath} debe ser una fecha y hora válida`
-    );
-  }
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const millis = (hours * 60 + minutes) * 60 * 1000;
 
   return { value, millis };
 }
@@ -67,11 +86,11 @@ function validateServiceSelection(
     );
   }
 
-  const startTime = parseIsoDateTimeOrThrow(
+  const startTime = parseTimeOrThrow(
     startTimeRaw,
     `services[${index}].startTime`
   );
-  const endTime = parseIsoDateTimeOrThrow(
+  const endTime = parseTimeOrThrow(
     endTimeRaw,
     `services[${index}].endTime`
   );
@@ -120,6 +139,14 @@ export function validateCreateAppointmentDto(body: unknown): CreateAppointmentDt
     validateServiceSelection(serviceItem, index)
   );
 
+  const dateRaw = parsedBody.date;
+  if (typeof dateRaw !== "string" || dateRaw.trim() === "") {
+    throw CustomError.badRequest(
+      "date es requerido y debe ser un texto no vacío"
+    );
+  }
+  const date = parseIsoDateOrThrow(dateRaw, "date");
+
   const employeeIdRaw = parsedBody.employeeId;
   if (
     employeeIdRaw !== undefined &&
@@ -140,6 +167,7 @@ export function validateCreateAppointmentDto(body: unknown): CreateAppointmentDt
   return {
     businessId: normalizeSpaces(businessIdRaw),
     branchId: normalizeSpaces(branchIdRaw),
+    date,
     services,
     ...(employeeIdRaw !== undefined && {
       employeeId: normalizeSpaces(employeeIdRaw),

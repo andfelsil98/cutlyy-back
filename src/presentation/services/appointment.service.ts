@@ -22,8 +22,8 @@ const USERS_COLLECTION = "Users";
 
 interface AppointmentServiceSelectionStored {
   id: string;
-  startTime: Timestamp;
-  endTime: Timestamp;
+  startTime: string;
+  endTime: string;
 }
 
 interface AppointmentServiceSelectionResponse {
@@ -32,7 +32,8 @@ interface AppointmentServiceSelectionResponse {
   endTime: string;
 }
 
-type AppointmentStored = Omit<Appointment, "services"> & {
+type AppointmentStored = Omit<Appointment, "services" | "date"> & {
+  date: Timestamp | string;
   services: AppointmentServiceSelectionStored[] | AppointmentServiceSelectionResponse[];
 };
 
@@ -42,11 +43,16 @@ export class AppointmentService {
       businessId?: string;
       id?: string;
       employeeId?: string;
+      startDate?: string;
+      endDate?: string;
+      sameDate?: boolean;
     }
   ): Promise<PaginatedResult<Appointment>> {
     try {
       const page = Math.max(1, params.page);
       const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, params.pageSize));
+      const useSameDate = params.sameDate === true && params.startDate != null;
+      const useRange = !useSameDate && (params.startDate != null || params.endDate != null);
       const filters = [
         ...(params.businessId != null && params.businessId.trim() !== ""
           ? [
@@ -75,12 +81,45 @@ export class AppointmentService {
               },
             ]
           : []),
+        ...(useSameDate
+          ? [
+              {
+                field: "date" as const,
+                operator: "==" as const,
+                value: params.startDate!,
+              },
+            ]
+          : []),
+        ...(!useSameDate && params.startDate != null
+          ? [
+              {
+                field: "date" as const,
+                operator: ">=" as const,
+                value: params.startDate,
+              },
+            ]
+          : []),
+        ...(!useSameDate && params.endDate != null
+          ? [
+              {
+                field: "date" as const,
+                operator: "<=" as const,
+                value: params.endDate,
+              },
+            ]
+          : []),
       ];
 
       const result = await FirestoreService.getAllPaginated<AppointmentStored>(
         COLLECTION_NAME,
         { page, pageSize },
-        filters
+        filters,
+        useRange
+          ? {
+              field: "date",
+              direction: "desc",
+            }
+          : undefined
       );
       return {
         ...result,
@@ -104,13 +143,14 @@ export class AppointmentService {
 
       const servicesForStorage = dto.services.map((service) => ({
         id: service.id,
-        startTime: Timestamp.fromDate(new Date(service.startTime)),
-        endTime: Timestamp.fromDate(new Date(service.endTime)),
+        startTime: service.startTime,
+        endTime: service.endTime,
       }));
 
       const data = {
         businessId: dto.businessId,
         branchId: dto.branchId,
+        date: dto.date,
         services: servicesForStorage,
         ...(dto.employeeId !== undefined && { employeeId: dto.employeeId }),
         clientId: dto.clientId,
@@ -121,6 +161,7 @@ export class AppointmentService {
       const created = await FirestoreService.create<{
         businessId: string;
         branchId: string;
+        date: string;
         services: AppointmentServiceSelectionStored[];
         employeeId?: string;
         clientId: string;
@@ -222,20 +263,18 @@ export class AppointmentService {
   private mapAppointmentToResponse(appointment: AppointmentStored): Appointment {
     const services = appointment.services.map((service) => ({
       id: service.id,
-      startTime:
-        service.startTime instanceof Timestamp
-          ? service.startTime.toDate().toISOString()
-          : service.startTime,
-      endTime:
-        service.endTime instanceof Timestamp
-          ? service.endTime.toDate().toISOString()
-          : service.endTime,
+      startTime: service.startTime,
+      endTime: service.endTime,
     }));
 
     return {
       id: appointment.id,
       businessId: appointment.businessId,
       branchId: appointment.branchId,
+      date:
+        appointment.date instanceof Timestamp
+          ? appointment.date.toDate().toISOString().split("T")[0]!
+          : appointment.date,
       services,
       ...(appointment.employeeId !== undefined && {
         employeeId: appointment.employeeId,
