@@ -199,27 +199,25 @@ export class BusinessMembershipService {
       return new Map();
     }
 
-    const rolesByIdEntries = await Promise.all(
-      roleIds.map(async (roleId) => {
-        if (this.roleService) {
-          try {
-            const result = await this.roleService.getRoleWithPermissionsById(roleId);
-            return [roleId, result.role] as const;
-          } catch {
-            return [roleId, null] as const;
-          }
-        }
+    const CHUNK_SIZE = 30;
+    const chunks: string[][] = [];
+    for (let i = 0; i < roleIds.length; i += CHUNK_SIZE) {
+      chunks.push(roleIds.slice(i, i + CHUNK_SIZE));
+    }
 
-        const roles = await FirestoreService.getAll<Role>(ROLE_COLLECTION, [
-          { field: "id", operator: "==", value: roleId },
-        ]);
-        return [roleId, roles[0] ?? null] as const;
-      })
+    const results = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<Role>(ROLE_COLLECTION, [
+          { field: "id", operator: "in", value: chunk },
+        ])
+      )
     );
 
-    return new Map(
-      rolesByIdEntries.filter((entry): entry is readonly [string, Role] => entry[1] != null)
-    );
+    const rolesMap = new Map<string, Role>();
+    for (const role of results.flat()) {
+      rolesMap.set(role.id, role);
+    }
+    return rolesMap;
   }
 
   private async getUsersByMembershipUserId(
@@ -229,26 +227,58 @@ export class BusinessMembershipService {
       return new Map();
     }
 
-    const usersByIdEntries = await Promise.all(
-      userIds.map(async (membershipUserId) => {
-        if (this.userService) {
-          const userById = await this.userService.getById(membershipUserId);
-          if (userById) {
-            return [membershipUserId, userById] as const;
-          }
+    const CHUNK_SIZE = 30;
+    const chunks: string[][] = [];
+    for (let i = 0; i < userIds.length; i += CHUNK_SIZE) {
+      chunks.push(userIds.slice(i, i + CHUNK_SIZE));
+    }
+
+    // Batch fetch por id de Firestore
+    const byIdResults = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<User>(USER_COLLECTION, [
+          { field: "id", operator: "in", value: chunk },
+        ])
+      )
+    );
+
+    const usersMap = new Map<string, User>();
+    const foundIds = new Set<string>();
+    for (const user of byIdResults.flat()) {
+      usersMap.set(user.id, user);
+      foundIds.add(user.id);
+    }
+
+    // Compatibilidad con membresías antiguas que guardan documento en userId.
+    const missingUserIds = userIds.filter((uid) => !foundIds.has(uid));
+    if (missingUserIds.length > 0) {
+      const missingChunks: string[][] = [];
+      for (let i = 0; i < missingUserIds.length; i += CHUNK_SIZE) {
+        missingChunks.push(missingUserIds.slice(i, i + CHUNK_SIZE));
+      }
+
+      const byDocResults = await Promise.all(
+        missingChunks.map((chunk) =>
+          FirestoreService.getAll<User>(USER_COLLECTION, [
+            { field: "document", operator: "in", value: chunk },
+          ])
+        )
+      );
+
+      const usersByDocument = new Map<string, User>();
+      for (const user of byDocResults.flat()) {
+        usersByDocument.set(user.document, user);
+      }
+
+      for (const membershipUserId of missingUserIds) {
+        const user = usersByDocument.get(membershipUserId);
+        if (user) {
+          usersMap.set(membershipUserId, user);
         }
+      }
+    }
 
-        // Compatibilidad con membresías antiguas que guardan documento en userId.
-        const usersByDocument = await FirestoreService.getAll<User>(USER_COLLECTION, [
-          { field: "document", operator: "==", value: membershipUserId },
-        ]);
-        return [membershipUserId, usersByDocument[0] ?? null] as const;
-      })
-    );
-
-    return new Map(
-      usersByIdEntries.filter((entry): entry is readonly [string, User] => entry[1] != null)
-    );
+    return usersMap;
   }
 
   async create(data: CreateBusinessMembershipData): Promise<BusinessMembership> {

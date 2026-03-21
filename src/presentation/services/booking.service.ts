@@ -7,12 +7,14 @@ import type {
   BookingPaymentStatus,
   BookingStatus,
 } from "../../domain/interfaces/booking.interface";
+import type { Business } from "../../domain/interfaces/business.interface";
 import type { Service } from "../../domain/interfaces/service.interface";
 import type {
   PaginatedResult,
   PaginationParams,
 } from "../../domain/interfaces/pagination.interface";
 import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
+import { normalizeBookingConsecutive } from "../../domain/utils/booking-consecutive.utils";
 import type {
   CreateBookingAppointmentDto,
   CreateBookingDto,
@@ -25,8 +27,10 @@ import type { AppointmentStatusTaskScheduler } from "./appointment-status-task-s
 import { logger } from "../../infrastructure/logger/logger";
 import type { WhatsAppService } from "./whatsapp.service";
 import { UserService } from "./user.service";
+import { BookingConsecutiveService } from "./booking-consecutive.service";
 
 const BOOKINGS_COLLECTION = "Bookings";
+const BUSINESSES_COLLECTION = "Businesses";
 const APPOINTMENTS_COLLECTION = "Appointments";
 const SERVICES_COLLECTION = "Services";
 
@@ -36,27 +40,56 @@ export class BookingService {
     private readonly reviewService: ReviewService = new ReviewService(),
     private readonly appointmentStatusTaskScheduler?: AppointmentStatusTaskScheduler,
     private readonly whatsAppService?: WhatsAppService,
-    private readonly userService: UserService = new UserService()
+    private readonly userService: UserService = new UserService(),
+    private readonly bookingConsecutiveService: BookingConsecutiveService =
+      new BookingConsecutiveService()
   ) {}
 
   async getAllBookings(
-    params: PaginationParams & { id?: string }
+    params: PaginationParams & {
+      id?: string;
+      businessId?: string;
+      consecutive?: string;
+      includeDeletes?: boolean;
+    }
   ): Promise<PaginatedResult<Booking>> {
     try {
       const page = Math.max(1, params.page);
       const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, params.pageSize));
       const filters = [
-        {
-          field: "status" as const,
-          operator: "in" as const,
-          value: ["CREATED", "CANCELLED", "FINISHED"],
-        },
+        ...(!params.includeDeletes
+          ? [
+              {
+                field: "status" as const,
+                operator: "in" as const,
+                value: ["CREATED", "CANCELLED", "FINISHED"],
+              },
+            ]
+          : []),
         ...(params.id != null && params.id.trim() !== ""
           ? [
               {
                 field: "id" as const,
                 operator: "==" as const,
                 value: params.id.trim(),
+              },
+            ]
+          : []),
+        ...(params.businessId != null && params.businessId.trim() !== ""
+          ? [
+              {
+                field: "businessId" as const,
+                operator: "==" as const,
+                value: params.businessId.trim(),
+              },
+            ]
+          : []),
+        ...(params.consecutive != null && params.consecutive.trim() !== ""
+          ? [
+              {
+                field: "consecutive" as const,
+                operator: "==" as const,
+                value: normalizeBookingConsecutive(params.consecutive),
               },
             ]
           : []),
@@ -107,6 +140,10 @@ export class BookingService {
         ...(dto.clientEmail !== undefined && { email: dto.clientEmail }),
       });
 
+      const business = await FirestoreService.getById<Business>(
+        BUSINESSES_COLLECTION,
+        dto.businessId
+      );
       const totalPrice = await this.calculateTotalPrice(dto.businessId, dto.appointments);
       const paidAmount = dto.paidAmount ?? 0;
       if (paidAmount > totalPrice) {
@@ -115,10 +152,15 @@ export class BookingService {
         );
       }
       const paymentStatus = this.resolvePaymentStatus(totalPrice, paidAmount);
+      const consecutive = await this.bookingConsecutiveService.generateUniqueConsecutive(
+        dto.businessId,
+        business
+      );
 
       const createdBooking = await FirestoreService.create<{
         businessId: string;
         branchId: string;
+        consecutive: string;
         appointments: string[];
         clientId: string;
         status: "CREATED";
@@ -130,6 +172,7 @@ export class BookingService {
       }>(BOOKINGS_COLLECTION, {
         businessId: dto.businessId,
         branchId: dto.branchId,
+        consecutive,
         appointments: [],
         clientId: dto.clientId,
         status: "CREATED",
@@ -141,6 +184,7 @@ export class BookingService {
       });
       createdBookingId = createdBooking.id;
 
+      this.appointmentService.clearValidationCache();
       for (const appointmentInput of dto.appointments) {
         const createdAppointment =
           await this.appointmentService.createAppointmentForBooking({
@@ -154,6 +198,7 @@ export class BookingService {
         createdAppointmentIds.push(createdAppointment.id);
         createdAppointments.push(createdAppointment);
       }
+      this.appointmentService.clearValidationCache();
 
       await FirestoreService.update(BOOKINGS_COLLECTION, createdBooking.id, {
         appointments: createdAppointmentIds,
@@ -162,7 +207,13 @@ export class BookingService {
 
       await this.scheduleStatusTasksForCreatedBookingAppointments(createdAppointments);
 
-      await this.sendBookingCreatedWhatsApp(dto.clientId).catch((whatsAppError) => {
+      await this.sendBookingCreatedWhatsApp(
+        createdBooking.id,
+        dto.businessId,
+        consecutive,
+        dto.clientId,
+        { cachedBusiness: business }
+      ).catch((whatsAppError) => {
         const detail =
           whatsAppError instanceof Error
             ? whatsAppError.message
@@ -240,8 +291,9 @@ export class BookingService {
       }
 
       const isDeletingBooking = dto.status === "DELETED";
+      let cachedServices: Service[] | undefined;
       if (!isDeletingBooking) {
-        await this.ensureServicesEditableForBookingUpdate(
+        cachedServices = await this.ensureServicesEditableForBookingUpdate(
           existingBooking.businessId,
           dto
         );
@@ -284,6 +336,11 @@ export class BookingService {
               "No se puede editar una cita eliminada"
             );
           }
+          if (appointment.status === "IN_PROGRESS") {
+            throw CustomError.badRequest(
+              "No se puede editar una cita en curso"
+            );
+          }
 
           await this.appointmentService.updateAppointment(
             operation.appointmentId,
@@ -300,7 +357,7 @@ export class BookingService {
       }
 
       const normalizedAppointmentIds = Array.from(appointmentIds);
-      if (normalizedAppointmentIds.length === 0) {
+      if (normalizedAppointmentIds.length === 0 && !isDeletingBooking) {
         throw CustomError.badRequest(
           "Un booking debe incluir al menos un servicio/cita"
         );
@@ -312,7 +369,8 @@ export class BookingService {
       if (!isDeletingBooking) {
         totalAmount = await this.calculateTotalPriceFromAppointments(
           existingBooking.businessId,
-          normalizedAppointmentIds
+          normalizedAppointmentIds,
+          cachedServices
         );
         if (paidAmount > totalAmount) {
           throw CustomError.badRequest(
@@ -382,10 +440,13 @@ export class BookingService {
         dto.status !== undefined &&
         (dto.status === "CANCELLED" || dto.status === "DELETED") &&
         existingBooking.status !== dto.status &&
-        existingBooking.status !== "FINISHED"
+        existingBooking.status !== "FINISHED" &&
+        !(dto.status === "DELETED" && existingBooking.status === "CANCELLED")
       ) {
         await this.sendBookingStatusChangedWhatsApp(
-          existingBooking.clientId
+          existingBooking.businessId,
+          existingBooking.clientId,
+          existingBooking.consecutive
         ).catch((whatsAppError) => {
           const detail =
             whatsAppError instanceof Error
@@ -396,6 +457,30 @@ export class BookingService {
 
           logger.warn(
             `[BookingService] No se pudo enviar WhatsApp de ${dto.status} para booking ${existingBooking.id}. detalle=${detail}`
+          );
+        });
+      }
+
+      if (
+        !hasBookingEditChanges &&
+        dto.status === "FINISHED" &&
+        existingBooking.status !== "FINISHED"
+      ) {
+        await this.sendBookingFinishedWhatsApp(
+          existingBooking.id,
+          existingBooking.businessId,
+          existingBooking.clientId,
+          existingBooking.consecutive
+        ).catch((whatsAppError) => {
+          const detail =
+            whatsAppError instanceof Error
+              ? whatsAppError.message
+              : typeof whatsAppError === "string"
+                ? whatsAppError
+                : JSON.stringify(whatsAppError);
+
+          logger.warn(
+            `[BookingService] No se pudo enviar WhatsApp de FINISHED para booking ${existingBooking.id}. detalle=${detail}`
           );
         });
       }
@@ -416,38 +501,132 @@ export class BookingService {
     }
   }
 
-  private async sendBookingCreatedWhatsApp(clientDocument: string): Promise<void> {
-    if (this.whatsAppService == null) return;
-
-    const sanitizedDocument = clientDocument.trim();
-    if (sanitizedDocument === "") return;
-
-    const user = await this.userService.getByDocument(sanitizedDocument);
-    const phone = user?.phone?.trim() ?? "";
-    if (phone === "") return;
-
-    await this.whatsAppService.sendTemplateMessage({
-      to: phone,
-      templateType: "APPOINTMENT_CONFIRMATION",
-    });
-  }
-
-  private async sendBookingStatusChangedWhatsApp(
-    clientDocument: string
+  private async sendBookingCreatedWhatsApp(
+    bookingId: string,
+    businessId: string,
+    bookingConsecutive: string,
+    clientDocument: string,
+    opts?: { cachedBusiness?: Business }
   ): Promise<void> {
     if (this.whatsAppService == null) return;
 
     const sanitizedDocument = clientDocument.trim();
     if (sanitizedDocument === "") return;
 
-    const user = await this.userService.getByDocument(sanitizedDocument);
+    const [user, business] = await Promise.all([
+      this.userService.getByDocument(sanitizedDocument),
+      opts?.cachedBusiness
+        ? Promise.resolve(opts.cachedBusiness)
+        : FirestoreService.getById<Business>(BUSINESSES_COLLECTION, businessId),
+    ]);
     const phone = user?.phone?.trim() ?? "";
     if (phone === "") return;
+    const businessName = business.name?.trim() || "Cutlyy";
+    const clientName = user?.name?.trim() || "cliente";
 
-    await this.whatsAppService.sendTemplateMessage({
+    const sendResult = await this.whatsAppService.sendTemplateMessage({
       to: phone,
       templateType: "APPOINTMENT_CONFIRMATION",
+      headerPlaceholders: [businessName],
+      bodyPlaceholders: [clientName, bookingConsecutive],
+      buttons: [
+        {
+          type: "URL",
+          parameter: bookingId,
+        },
+      ],
     });
+
+    logger.info(
+      `[BookingService] WhatsApp de confirmacion aceptado por Infobip. bookingId=${bookingId}, to=${phone}, templateType=APPOINTMENT_CONFIRMATION, messageId=${sendResult.messageId}`
+    );
+  }
+
+  private async sendBookingStatusChangedWhatsApp(
+    businessId: string,
+    clientDocument: string,
+    bookingConsecutive: string,
+    opts?: { cachedBusiness?: Business }
+  ): Promise<void> {
+    if (this.whatsAppService == null) return;
+
+    const sanitizedDocument = clientDocument.trim();
+    if (sanitizedDocument === "") return;
+
+    const [user, business] = await Promise.all([
+      this.userService.getByDocument(sanitizedDocument),
+      opts?.cachedBusiness
+        ? Promise.resolve(opts.cachedBusiness)
+        : FirestoreService.getById<Business>(BUSINESSES_COLLECTION, businessId),
+    ]);
+    const phone = user?.phone?.trim() ?? "";
+    if (phone === "") return;
+    const businessName = business.name?.trim() || "Cutlyy";
+    const businessSlug = business.slug?.trim() ?? "";
+    if (businessSlug === "") {
+      throw CustomError.internalServerError(
+        `El negocio ${businessId} no tiene slug configurado para enviar WhatsApp`
+      );
+    }
+    const clientName = user?.name?.trim() || "cliente";
+
+    const sendResult = await this.whatsAppService.sendTemplateMessage({
+      to: phone,
+      templateType: "APPOINTMENT_MODIFICATION",
+      headerPlaceholders: [businessName],
+      bodyPlaceholders: [clientName, bookingConsecutive],
+      buttons: [
+        {
+          type: "URL",
+          parameter: businessSlug,
+        },
+      ],
+    });
+
+    logger.info(
+      `[BookingService] WhatsApp de cancelacion aceptado por Infobip. businessId=${businessId}, to=${phone}, templateType=APPOINTMENT_MODIFICATION, messageId=${sendResult.messageId}`
+    );
+  }
+
+  private async sendBookingFinishedWhatsApp(
+    bookingId: string,
+    businessId: string,
+    clientDocument: string,
+    bookingConsecutive: string,
+    opts?: { cachedBusiness?: Business }
+  ): Promise<void> {
+    if (this.whatsAppService == null) return;
+
+    const sanitizedDocument = clientDocument.trim();
+    if (sanitizedDocument === "") return;
+
+    const [user, business] = await Promise.all([
+      this.userService.getByDocument(sanitizedDocument),
+      opts?.cachedBusiness
+        ? Promise.resolve(opts.cachedBusiness)
+        : FirestoreService.getById<Business>(BUSINESSES_COLLECTION, businessId),
+    ]);
+    const phone = user?.phone?.trim() ?? "";
+    if (phone === "") return;
+    const businessName = business.name?.trim() || "Cutlyy";
+    const clientName = user?.name?.trim() || "cliente";
+
+    const sendResult = await this.whatsAppService.sendTemplateMessage({
+      to: phone,
+      templateType: "APPOINTMENT_COMPLETION",
+      headerPlaceholders: [businessName],
+      bodyPlaceholders: [clientName, bookingConsecutive],
+      buttons: [
+        {
+          type: "URL",
+          parameter: bookingId,
+        },
+      ],
+    });
+
+    logger.info(
+      `[BookingService] WhatsApp de finalizacion aceptado por Infobip. bookingId=${bookingId}, to=${phone}, templateType=APPOINTMENT_COMPLETION, messageId=${sendResult.messageId}`
+    );
   }
 
   private async scheduleStatusTasksForCreatedBookingAppointments(
@@ -485,24 +664,30 @@ export class BookingService {
     bookingId: string | null,
     appointmentIds: string[]
   ): Promise<void> {
-    const deletedAt = FirestoreDataBase.generateTimeStamp();
+    try {
+      const db = FirestoreDataBase.getDB();
+      const batch = db.batch();
+      const deletedAt = FirestoreDataBase.generateTimeStamp();
 
-    await Promise.allSettled(
-      appointmentIds.map((appointmentId) =>
-        FirestoreService.update("Appointments", appointmentId, {
+      for (const appointmentId of appointmentIds) {
+        batch.update(db.collection(APPOINTMENTS_COLLECTION).doc(appointmentId), {
           status: "DELETED",
           deletedAt,
-        }).catch(() => undefined)
-      )
-    );
+        });
+      }
 
-    if (bookingId) {
-      await FirestoreService.update(BOOKINGS_COLLECTION, bookingId, {
-        appointments: appointmentIds,
-        status: "DELETED",
-        deletedAt,
-        updatedAt: deletedAt,
-      }).catch(() => undefined);
+      if (bookingId) {
+        batch.update(db.collection(BOOKINGS_COLLECTION).doc(bookingId), {
+          appointments: appointmentIds,
+          status: "DELETED",
+          deletedAt,
+          updatedAt: deletedAt,
+        });
+      }
+
+      await batch.commit();
+    } catch {
+      // Compensación best-effort: si falla el batch, no propagamos el error
     }
   }
 
@@ -518,15 +703,12 @@ export class BookingService {
 
   private async calculateTotalPriceFromAppointments(
     businessId: string,
-    appointmentIds: string[]
+    appointmentIds: string[],
+    cachedServices?: Service[]
   ): Promise<number> {
     if (appointmentIds.length === 0) return 0;
 
-    const appointments = await Promise.all(
-      appointmentIds.map((appointmentId) =>
-        this.appointmentService.getAppointmentById(appointmentId)
-      )
-    );
+    const appointments = await this.appointmentService.getAppointmentsByIds(appointmentIds);
     const activeServiceIds = appointments
       .filter(
         (appointment) =>
@@ -535,7 +717,7 @@ export class BookingService {
       .map((appointment) => appointment.serviceId.trim())
       .filter((serviceId) => serviceId !== "");
 
-    return this.calculateTotalPriceFromServiceIds(businessId, activeServiceIds);
+    return this.calculateTotalPriceFromServiceIds(businessId, activeServiceIds, cachedServices);
   }
 
   private ensureBookingAppointmentsNotInPast(
@@ -562,18 +744,19 @@ export class BookingService {
   private async ensureServicesEditableForBookingUpdate(
     businessId: string,
     dto: UpdateBookingDto
-  ): Promise<void> {
+  ): Promise<Service[]> {
+    const services = await FirestoreService.getAll<Service>(SERVICES_COLLECTION, [
+      { field: "businessId", operator: "==", value: businessId },
+    ]);
+
     const requestedServiceIds = (dto.operations ?? [])
       .filter((operation) => operation.op !== "cancel")
       .map((operation) => operation.serviceId.trim())
       .filter((serviceId) => serviceId !== "");
 
-    if (requestedServiceIds.length === 0) return;
+    if (requestedServiceIds.length === 0) return services;
 
     const requestedUniqueServiceIds = Array.from(new Set(requestedServiceIds));
-    const services = await FirestoreService.getAll<Service>(SERVICES_COLLECTION, [
-      { field: "businessId", operator: "==", value: businessId },
-    ]);
     const servicesById = new Map(
       services.map((service) => [service.id.trim(), service] as const)
     );
@@ -602,20 +785,24 @@ export class BookingService {
         `Los siguientes servicios no existen en el negocio: ${missingServiceIds.join(", ")}`
       );
     }
+
+    return services;
   }
 
   private async calculateTotalPriceFromServiceIds(
     businessId: string,
-    serviceIds: string[]
+    serviceIds: string[],
+    cachedServices?: Service[]
   ): Promise<number> {
     const requestedServiceIds = serviceIds.map((serviceId) => serviceId.trim());
     const requestedUniqueServiceIds = Array.from(
       new Set(requestedServiceIds.filter((serviceId) => serviceId !== ""))
     );
 
-    const services = await FirestoreService.getAll<Service>(SERVICES_COLLECTION, [
-      { field: "businessId", operator: "==", value: businessId },
-    ]);
+    const services = cachedServices ??
+      await FirestoreService.getAll<Service>(SERVICES_COLLECTION, [
+        { field: "businessId", operator: "==", value: businessId },
+      ]);
     const servicesById = new Map(
       services
         .filter((service) => service.status !== "DELETED")
@@ -660,54 +847,55 @@ export class BookingService {
   ): Promise<void> {
     if (appointmentIds.length === 0) return;
 
-    await Promise.all(
-      appointmentIds.map(async (appointmentId) => {
-        const appointment = await this.appointmentService.getAppointmentById(
-          appointmentId
-        );
-        if (appointment.status === "DELETED") {
-          return;
-        }
-        if (
-          appointment.status === "FINISHED" &&
-          status !== "DELETED" &&
-          status !== "FINISHED"
-        ) {
-          throw CustomError.badRequest(
-            `No se puede cambiar el estado de la cita ${appointmentId} porque está finalizada`
-          );
-        }
-        if (
-          status === "CREATED" &&
-          appointment.status !== "CREATED" &&
-          appointment.status !== "CANCELLED"
-        ) {
-          throw CustomError.badRequest(
-            `Solo se puede marcar en CREATED la cita ${appointmentId} si está CANCELLED`
-          );
-        }
-
-        if (status === "CANCELLED") {
-          await this.appointmentService.cancelAppointment(appointmentId);
-          return;
-        }
-
-        if (status === "DELETED") {
-          await this.appointmentService.deleteAppointment(appointmentId);
-          return;
-        }
-
-        const timestamp = FirestoreDataBase.generateTimeStamp();
-        const payload: Record<string, unknown> = {
-          status,
-          updatedAt: timestamp,
-        };
-        payload.cancelledAt = FieldValue.delete();
-        payload.deletedAt = FieldValue.delete();
-
-        await FirestoreService.update(APPOINTMENTS_COLLECTION, appointmentId, payload);
-      })
+    const appointments = await this.appointmentService.getAppointmentsByIds(appointmentIds);
+    const appointmentsById = new Map(
+      appointments.map((appointment) => [appointment.id, appointment])
     );
+
+    for (const appointmentId of appointmentIds) {
+      const appointment = appointmentsById.get(appointmentId);
+      if (!appointment || appointment.status === "DELETED") {
+        continue;
+      }
+      if (
+        appointment.status === "FINISHED" &&
+        status !== "DELETED" &&
+        status !== "FINISHED"
+      ) {
+        throw CustomError.badRequest(
+          `No se puede cambiar el estado de la cita ${appointmentId} porque está finalizada`
+        );
+      }
+      if (
+        status === "CREATED" &&
+        appointment.status !== "CREATED" &&
+        appointment.status !== "CANCELLED"
+      ) {
+        throw CustomError.badRequest(
+          `Solo se puede marcar en CREATED la cita ${appointmentId} si está CANCELLED`
+        );
+      }
+
+      if (status === "CANCELLED") {
+        await this.appointmentService.cancelAppointment(appointmentId);
+        continue;
+      }
+
+      if (status === "DELETED") {
+        await this.appointmentService.deleteAppointment(appointmentId);
+        continue;
+      }
+
+      const timestamp = FirestoreDataBase.generateTimeStamp();
+      const payload: Record<string, unknown> = {
+        status,
+        updatedAt: timestamp,
+      };
+      payload.cancelledAt = FieldValue.delete();
+      payload.deletedAt = FieldValue.delete();
+
+      await FirestoreService.update(APPOINTMENTS_COLLECTION, appointmentId, payload);
+    }
   }
 
   private async ensureBookingStatusTransitionAllowed(
@@ -726,11 +914,7 @@ export class BookingService {
     }
 
     if (nextStatus === "CANCELLED") {
-      const appointments = await Promise.all(
-        appointmentIds.map((appointmentId) =>
-          this.appointmentService.getAppointmentById(appointmentId)
-        )
-      );
+      const appointments = await this.appointmentService.getAppointmentsByIds(appointmentIds);
       const hasFinishedAppointment = appointments.some(
         (appointment) => appointment.status === "FINISHED"
       );
@@ -770,6 +954,7 @@ export class BookingService {
 
     return {
       ...booking,
+      consecutive: normalizeBookingConsecutive(booking.consecutive),
       appointments,
       totalAmount,
       paidAmount,

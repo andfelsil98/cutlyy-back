@@ -9,6 +9,7 @@ import type { Branch } from "../../domain/interfaces/branch.interface";
 import type { Service } from "../../domain/interfaces/service.interface";
 import type { PaginatedResult, PaginationParams } from "../../domain/interfaces/pagination.interface";
 import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
+import { normalizeConsecutivePrefix } from "../../domain/utils/booking-consecutive.utils";
 import type { CreateBusinessDto } from "../business/dtos/create-business.dto";
 import type { CreateBusinessCompleteDto } from "../business/dtos/create-business-complete.dto";
 import type { UpdateBusinessDto } from "../business/dtos/update-business.dto";
@@ -45,7 +46,7 @@ export class BusinessService {
   ) {}
 
   async getAllBusinesses(
-    params: PaginationParams & { id?: string; slug?: string }
+    params: PaginationParams & { id?: string; slug?: string; consecutivePrefix?: string }
   ): Promise<PaginatedResult<Business>> {
     try {
       const page = Math.max(1, params.page);
@@ -62,8 +63,17 @@ export class BusinessService {
         ...(params.slug != null && params.slug.trim() !== ""
           ? [{ field: "slug" as const, operator: "==" as const, value: params.slug.trim().toLowerCase() }]
           : []),
+        ...(params.consecutivePrefix != null && params.consecutivePrefix.trim() !== ""
+          ? [
+              {
+                field: "consecutivePrefix" as const,
+                operator: "==" as const,
+                value: normalizeConsecutivePrefix(params.consecutivePrefix),
+              },
+            ]
+          : []),
       ];
-      return await FirestoreService.getAllPaginated<Business>(
+      const result = await FirestoreService.getAllPaginated<Business>(
         COLLECTION_NAME,
         {
           page,
@@ -71,6 +81,10 @@ export class BusinessService {
         },
         filters
       );
+      return {
+        ...result,
+        data: result.data.map((business) => this.normalizeBusiness(business)),
+      };
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -79,23 +93,39 @@ export class BusinessService {
 
   async createBusiness(dto: CreateBusinessDto): Promise<Business> {
     try {
-      const existing = await FirestoreService.getAll<Business>(COLLECTION_NAME);
+      const existing = await FirestoreService.getAll<Business>(COLLECTION_NAME, [
+        { field: "status", operator: "in", value: ["ACTIVE", "INACTIVE", "PENDING"] },
+      ]);
       const incomingNameKey = toNameKey(dto.name);
       const duplicated = existing.some((business) => toNameKey(business.name) === incomingNameKey);
       if (duplicated) {
         throw CustomError.conflict("Ya existe un negocio con este nombre");
       }
+      const businessWithSameConsecutivePrefix = await FirestoreService.getAll<Business>(
+        COLLECTION_NAME,
+        [
+          {
+            field: "consecutivePrefix",
+            operator: "==",
+            value: normalizeConsecutivePrefix(dto.consecutivePrefix),
+          },
+        ]
+      );
+      if (businessWithSameConsecutivePrefix.length > 0) {
+        throw CustomError.conflict("Ya existe un negocio con este consecutivePrefix");
+      }
       const data = {
         name: dto.name,
         type: dto.type,
         slug: dto.slug,
+        consecutivePrefix: dto.consecutivePrefix,
         employees: [] as string[],
         logoUrl: dto.logoUrl ?? "",
         status: "ACTIVE" as const,
         createdAt: FirestoreDataBase.generateTimeStamp(),
       };
       const result = await FirestoreService.create(COLLECTION_NAME, data);
-      return result;
+      return this.normalizeBusiness(result);
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -111,6 +141,7 @@ export class BusinessService {
         name: dto.name,
         type: dto.type,
         slug: dto.slug,
+        consecutivePrefix: dto.consecutivePrefix,
         ...(dto.logoUrl !== undefined && dto.logoUrl !== "" && { logoUrl: dto.logoUrl }),
       });
 
@@ -148,7 +179,7 @@ export class BusinessService {
       if (dto.name !== undefined) {
         const withSameName = await FirestoreService.getAll<Business>(
           COLLECTION_NAME,
-          []
+          [{ field: "status", operator: "in", value: ["ACTIVE", "INACTIVE", "PENDING"] }]
         );
         const incomingNameKey = toNameKey(dto.name);
         const otherWithSameName = withSameName.filter(
@@ -158,12 +189,34 @@ export class BusinessService {
           throw CustomError.conflict("Ya existe un negocio con este nombre");
         }
       }
+      if (dto.consecutivePrefix !== undefined) {
+        const businessesWithSameConsecutivePrefix = await FirestoreService.getAll<Business>(
+          COLLECTION_NAME,
+          [
+            {
+              field: "consecutivePrefix",
+              operator: "==",
+              value: normalizeConsecutivePrefix(dto.consecutivePrefix),
+            },
+          ]
+        );
+        const otherBusinessWithSameConsecutivePrefix =
+          businessesWithSameConsecutivePrefix.filter((business) => business.id !== id);
+        if (otherBusinessWithSameConsecutivePrefix.length > 0) {
+          throw CustomError.conflict(
+            "Ya existe un negocio con este consecutivePrefix"
+          );
+        }
+      }
 
       const payload: Record<string, unknown> = {
         updatedAt: FirestoreDataBase.generateTimeStamp(),
       };
       if (dto.name !== undefined) payload.name = dto.name;
       if (dto.type !== undefined) payload.type = dto.type;
+      if (dto.consecutivePrefix !== undefined) {
+        payload.consecutivePrefix = dto.consecutivePrefix;
+      }
       if (dto.logoUrl !== undefined) payload.logoUrl = dto.logoUrl;
       if (dto.slug !== undefined) payload.slug = dto.slug;
 
@@ -176,7 +229,9 @@ export class BusinessService {
         await this.syncBranches(id, dto.branches);
       }
 
-      return await FirestoreService.getById<Business>(COLLECTION_NAME, id);
+      return this.normalizeBusiness(
+        await FirestoreService.getById<Business>(COLLECTION_NAME, id)
+      );
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -196,7 +251,9 @@ export class BusinessService {
       await this.markMembershipsAsDeletedByBusiness(id, deletedAt);
       await this.hardDeleteBusinessRelations(id);
       await this.deleteBusinessStorageFolder(id);
-      return await FirestoreService.getById<Business>(COLLECTION_NAME, id);
+      return this.normalizeBusiness(
+        await FirestoreService.getById<Business>(COLLECTION_NAME, id)
+      );
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -239,7 +296,9 @@ export class BusinessService {
         await this.ensureCreatorMembership(id, opts.actorDocument);
       }
 
-      return await FirestoreService.getById<Business>(COLLECTION_NAME, id);
+      return this.normalizeBusiness(
+        await FirestoreService.getById<Business>(COLLECTION_NAME, id)
+      );
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -538,5 +597,12 @@ export class BusinessService {
         })
       )
     );
+  }
+
+  private normalizeBusiness(business: Business): Business {
+    return {
+      ...business,
+      consecutivePrefix: normalizeConsecutivePrefix(business.consecutivePrefix),
+    };
   }
 }

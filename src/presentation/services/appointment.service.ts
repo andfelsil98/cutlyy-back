@@ -24,6 +24,7 @@ import { ReviewService } from "./review.service";
 import type { AppointmentStatusTaskScheduler } from "./appointment-status-task-scheduler.service";
 import { logger } from "../../infrastructure/logger/logger";
 import { MetricService } from "./metric.service";
+import { BookingConsecutiveService } from "./booking-consecutive.service";
 
 const COLLECTION_NAME = "Appointments";
 const BOOKINGS_COLLECTION = "Bookings";
@@ -93,11 +94,19 @@ export interface UpdateAppointmentOptions {
 }
 
 export class AppointmentService {
+  private validationCache = new Map<string, unknown>();
+
   constructor(
     private readonly reviewService: ReviewService = new ReviewService(),
     private readonly appointmentStatusTaskScheduler?: AppointmentStatusTaskScheduler,
-    private readonly metricService: MetricService = new MetricService()
+    private readonly metricService: MetricService = new MetricService(),
+    private readonly bookingConsecutiveService: BookingConsecutiveService =
+      new BookingConsecutiveService()
   ) {}
+
+  clearValidationCache(): void {
+    this.validationCache.clear();
+  }
 
   async getAllAppointments(
     params: PaginationParams & {
@@ -194,49 +203,18 @@ export class AppointmentService {
           : []),
       ];
 
-      const requiresInMemoryFiltering = hasDateFilters;
-
-      if (!requiresInMemoryFiltering) {
-        const result = await FirestoreService.getAllPaginated<AppointmentStored>(
-          COLLECTION_NAME,
-          { page, pageSize },
-          filters
-        );
-        return {
-          ...result,
-          data: result.data.map((appointment) =>
-            this.mapAppointmentToResponse(appointment)
-          ),
-        };
-      }
-
-      const orderedAppointments = await FirestoreService.getAll<AppointmentStored>(
+      const orderByField = hasDateFilters ? "date" : "createdAt";
+      const result = await FirestoreService.getAllPaginated<AppointmentStored>(
         COLLECTION_NAME,
+        { page, pageSize },
         filters,
-        {
-          field: hasDateFilters ? "date" : "createdAt",
-          direction: "desc",
-        }
+        { field: orderByField, direction: "desc" }
       );
-
-      const mapped = orderedAppointments.map((appointment) =>
-        this.mapAppointmentToResponse(appointment)
-      );
-
-      if (hasDateFilters) {
-        return {
-          data: mapped,
-          total: mapped.length,
-          pagination: buildPagination(1, Math.max(1, mapped.length), mapped.length),
-        };
-      }
-
-      const offset = (page - 1) * pageSize;
-      const pagedData = mapped.slice(offset, offset + pageSize);
       return {
-        data: pagedData,
-        total: mapped.length,
-        pagination: buildPagination(page, pageSize, mapped.length),
+        ...result,
+        data: result.data.map((appointment) =>
+          this.mapAppointmentToResponse(appointment)
+        ),
       };
     } catch (error) {
       if (error instanceof CustomError) throw error;
@@ -326,10 +304,14 @@ export class AppointmentService {
         ...(dto.clientPhone !== undefined && { phone: dto.clientPhone }),
         ...(dto.clientEmail !== undefined && { email: dto.clientEmail }),
       });
+      const consecutive = await this.bookingConsecutiveService.generateUniqueConsecutive(
+        dto.businessId
+      );
 
       const createdBooking = await FirestoreService.create<{
         businessId: string;
         branchId: string;
+        consecutive: string;
         appointments: string[];
         clientId: string;
         status: "CREATED";
@@ -341,6 +323,7 @@ export class AppointmentService {
       }>(BOOKINGS_COLLECTION, {
         businessId: dto.businessId,
         branchId: dto.branchId,
+        consecutive,
         appointments: [],
         clientId: dto.clientId,
         status: "CREATED",
@@ -489,6 +472,31 @@ export class AppointmentService {
     return this.mapAppointmentToResponse(appointment);
   }
 
+  async getAppointmentsByIds(ids: string[]): Promise<Appointment[]> {
+    const uniqueIds = Array.from(
+      new Set(ids.map((id) => id.trim()).filter((id) => id !== ""))
+    );
+    if (uniqueIds.length === 0) return [];
+
+    const CHUNK_SIZE = 30;
+    const chunks: string[][] = [];
+    for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+      chunks.push(uniqueIds.slice(i, i + CHUNK_SIZE));
+    }
+
+    const results = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<AppointmentStored>(COLLECTION_NAME, [
+          { field: "id", operator: "in", value: chunk },
+        ])
+      )
+    );
+
+    return results
+      .flat()
+      .map((appointment) => this.mapAppointmentToResponse(appointment));
+  }
+
   async updateAppointment(
     id: string,
     dto: UpdateAppointmentDto,
@@ -499,12 +507,13 @@ export class AppointmentService {
 
       const existingAppointment = await this.getStoredAppointmentById(id);
       if (
+        existingAppointment.status === "IN_PROGRESS" ||
         existingAppointment.status === "DELETED" ||
         existingAppointment.status === "CANCELLED" ||
         existingAppointment.status === "FINISHED"
       ) {
         throw CustomError.badRequest(
-          "No se puede editar una cita con estado FINISHED, DELETED o CANCELLED"
+          "No se puede editar una cita con estado IN_PROGRESS, FINISHED, DELETED o CANCELLED"
         );
       }
 
@@ -591,7 +600,14 @@ export class AppointmentService {
         COLLECTION_NAME,
         id
       );
-      return this.mapAppointmentToResponse(updated);
+      const mappedUpdatedAppointment = this.mapAppointmentToResponse(updated);
+
+      await this.rescheduleStatusTasksForAppointment(
+        mappedUpdatedAppointment,
+        "actualizar"
+      );
+
+      return mappedUpdatedAppointment;
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -610,6 +626,7 @@ export class AppointmentService {
         );
       }
       if (existingAppointment.status === "CANCELLED") {
+        await this.deleteStatusTasksForAppointment(id, "cancelar");
         return this.mapAppointmentToResponse(existingAppointment);
       }
 
@@ -650,6 +667,8 @@ export class AppointmentService {
           servicePrice: beforeServicePrice,
         }
       );
+
+      await this.deleteStatusTasksForAppointment(id, "cancelar");
 
       const cancelled = await this.getStoredAppointmentById(id);
       return this.mapAppointmentToResponse(cancelled);
@@ -697,6 +716,8 @@ export class AppointmentService {
         },
         null
       );
+
+      await this.deleteStatusTasksForAppointment(id, "eliminar");
 
       const deleted = await FirestoreService.getById<AppointmentStored>(
         COLLECTION_NAME,
@@ -994,6 +1015,60 @@ export class AppointmentService {
     });
   }
 
+  private async rescheduleStatusTasksForAppointment(
+    appointment: Appointment,
+    reason: string
+  ): Promise<void> {
+    if (this.appointmentStatusTaskScheduler == null) return;
+
+    try {
+      await this.appointmentStatusTaskScheduler.deleteAppointmentStatusTasks({
+        appointmentId: appointment.id,
+      });
+      await this.appointmentStatusTaskScheduler.scheduleAppointmentStatusTasks({
+        appointmentId: appointment.id,
+        date: appointment.date,
+        startTime: appointment.startTime,
+        endTime: appointment.endTime,
+      });
+    } catch (taskError) {
+      const detail =
+        taskError instanceof Error
+          ? taskError.message
+          : typeof taskError === "string"
+            ? taskError
+            : JSON.stringify(taskError);
+
+      logger.warn(
+        `[AppointmentService] No se pudieron reprogramar tasks automáticas al ${reason} la cita ${appointment.id}. detalle=${detail}`
+      );
+    }
+  }
+
+  private async deleteStatusTasksForAppointment(
+    appointmentId: string,
+    reason: string
+  ): Promise<void> {
+    if (this.appointmentStatusTaskScheduler == null) return;
+
+    try {
+      await this.appointmentStatusTaskScheduler.deleteAppointmentStatusTasks({
+        appointmentId,
+      });
+    } catch (taskError) {
+      const detail =
+        taskError instanceof Error
+          ? taskError.message
+          : typeof taskError === "string"
+            ? taskError
+            : JSON.stringify(taskError);
+
+      logger.warn(
+        `[AppointmentService] No se pudieron eliminar tasks automáticas al ${reason} la cita ${appointmentId}. detalle=${detail}`
+      );
+    }
+  }
+
   private async getStoredAppointmentById(id: string): Promise<AppointmentStored> {
     const appointments = await FirestoreService.getAll<AppointmentStored>(
       COLLECTION_NAME,
@@ -1146,6 +1221,9 @@ export class AppointmentService {
   }
 
   private async ensureBusinessExists(businessId: string): Promise<void> {
+    const cacheKey = `business:${businessId}`;
+    if (this.validationCache.has(cacheKey)) return;
+
     const businesses = await FirestoreService.getAll<Business>(BUSINESS_COLLECTION, [
       { field: "id", operator: "==", value: businessId },
     ]);
@@ -1159,12 +1237,18 @@ export class AppointmentService {
         "No se pueden crear citas para un negocio eliminado"
       );
     }
+
+    this.validationCache.set(cacheKey, true);
   }
 
   private async ensureBranchBelongsToBusiness(
     branchId: string,
     businessId: string
   ): Promise<Branch> {
+    const cacheKey = `branch:${branchId}:${businessId}`;
+    const cachedBranch = this.validationCache.get(cacheKey) as Branch | undefined;
+    if (cachedBranch) return cachedBranch;
+
     const branches = await FirestoreService.getAll<Branch>(BRANCH_COLLECTION, [
       { field: "id", operator: "==", value: branchId },
     ]);
@@ -1186,6 +1270,7 @@ export class AppointmentService {
       );
     }
 
+    this.validationCache.set(cacheKey, branch);
     return branch;
   }
 

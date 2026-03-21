@@ -3,6 +3,12 @@ export interface SendWhatsAppTemplateMessagePayload {
   templateName: string;
   language: string;
   placeholders?: string[];
+  headerPlaceholders?: string[];
+  bodyPlaceholders?: string[];
+  buttons?: Array<{
+    type: "URL";
+    parameter: string;
+  }>;
 }
 
 export interface SendWhatsAppMessageResult {

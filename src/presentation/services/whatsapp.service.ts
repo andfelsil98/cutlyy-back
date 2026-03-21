@@ -12,6 +12,12 @@ export interface SendWhatsAppTemplateByTypeParams {
   to: string;
   templateType: WhatsAppTemplateType;
   placeholders?: string[];
+  headerPlaceholders?: string[];
+  bodyPlaceholders?: string[];
+  buttons?: Array<{
+    type: "URL";
+    parameter: string;
+  }>;
 }
 
 export class WhatsAppService {
@@ -38,14 +44,21 @@ export class WhatsAppService {
       );
     }
 
-    const resolvedPlaceholders = params.placeholders ?? template.defaultPlaceholders;
+    const resolvedBodyPlaceholders =
+      params.bodyPlaceholders ?? params.placeholders ?? template.defaultPlaceholders;
 
     return this.provider.sendTemplateMessage({
       to: normalizedTo,
       templateName,
       language,
-      ...(resolvedPlaceholders != null && resolvedPlaceholders.length > 0 && {
-        placeholders: resolvedPlaceholders,
+      ...(params.headerPlaceholders != null && params.headerPlaceholders.length > 0 && {
+        headerPlaceholders: params.headerPlaceholders,
+      }),
+      ...(resolvedBodyPlaceholders != null && resolvedBodyPlaceholders.length > 0 && {
+        bodyPlaceholders: resolvedBodyPlaceholders,
+      }),
+      ...(params.buttons != null && params.buttons.length > 0 && {
+        buttons: params.buttons,
       }),
     });
   }

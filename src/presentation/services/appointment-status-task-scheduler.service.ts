@@ -2,9 +2,13 @@ import {
   CLOUD_TASK_TOKEN_HEADER,
   WHATSAPP_SEND_MESSAGE_PATH,
 } from "../../config/cloud-tasks.config";
-import type { WhatsAppMessageTaskType } from "../../config/whatsapp-message-types.config";
+import {
+  WHATSAPP_MESSAGE_TASK_TYPES,
+  type WhatsAppMessageTaskType,
+} from "../../config/whatsapp-message-types.config";
 import { CustomError } from "../../domain/errors/custom-error";
 import type { TaskQueueProvider } from "../../domain/interfaces/task-queue.interface";
+import { logger } from "../../infrastructure/logger/logger";
 
 export interface ScheduleAppointmentStatusTasksInput {
   appointmentId: string;
@@ -15,6 +19,7 @@ export interface ScheduleAppointmentStatusTasksInput {
 
 export interface AppointmentStatusTaskScheduler {
   scheduleAppointmentStatusTasks(input: ScheduleAppointmentStatusTasksInput): Promise<void>;
+  deleteAppointmentStatusTasks(input: { appointmentId: string }): Promise<void>;
 }
 
 export interface AppointmentStatusTaskSchedulerConfig {
@@ -33,10 +38,7 @@ export class AppointmentStatusTaskSchedulerService
   async scheduleAppointmentStatusTasks(
     input: ScheduleAppointmentStatusTasksInput
   ): Promise<void> {
-    const appointmentId = input.appointmentId.trim();
-    if (appointmentId === "") {
-      throw CustomError.badRequest("No se puede programar task sin appointmentId");
-    }
+    const appointmentId = this.normalizeAppointmentId(input.appointmentId);
 
     const targetBaseUrl = this.config.targetBaseUrl.trim();
     if (targetBaseUrl === "") {
@@ -72,6 +74,14 @@ export class AppointmentStatusTaskSchedulerService
     ]);
   }
 
+  async deleteAppointmentStatusTasks(input: { appointmentId: string }): Promise<void> {
+    const appointmentId = this.normalizeAppointmentId(input.appointmentId);
+
+    await Promise.all(
+      WHATSAPP_MESSAGE_TASK_TYPES.map((type) => this.deleteStatusTask(type, appointmentId))
+    );
+  }
+
   private async enqueueStatusTask(
     type: WhatsAppMessageTaskType,
     appointmentId: string,
@@ -82,10 +92,11 @@ export class AppointmentStatusTaskSchedulerService
   ): Promise<void> {
     const delaySeconds = this.computeDelaySeconds(date, time);
     const taskId = this.buildTaskId(type, appointmentId);
+    const url = this.buildTaskUrl(targetBaseUrl, type);
 
-    await this.taskQueueProvider.createHttpTask({
+    const task = await this.taskQueueProvider.createHttpTask({
       taskId,
-      url: this.buildTaskUrl(targetBaseUrl, type),
+      url,
       method: "POST",
       scheduleDelaySeconds: delaySeconds,
       headers: {
@@ -95,6 +106,23 @@ export class AppointmentStatusTaskSchedulerService
         appointmentId,
       },
     });
+
+    logger.info(
+      `[AppointmentStatusTaskSchedulerService] Task programada. type=${type}, appointmentId=${appointmentId}, taskId=${taskId}, taskName=${task.taskName}, scheduleTime=${task.scheduleTime ?? "immediate"}, url=${url}`
+    );
+  }
+
+  private async deleteStatusTask(
+    type: WhatsAppMessageTaskType,
+    appointmentId: string
+  ): Promise<void> {
+    const taskId = this.buildTaskId(type, appointmentId);
+
+    await this.taskQueueProvider.deleteTask(taskId);
+
+    logger.info(
+      `[AppointmentStatusTaskSchedulerService] Task eliminada. type=${type}, appointmentId=${appointmentId}, taskId=${taskId}`
+    );
   }
 
   private buildTaskUrl(targetBaseUrl: string, type: WhatsAppMessageTaskType): string {
@@ -104,6 +132,15 @@ export class AppointmentStatusTaskSchedulerService
 
   private buildTaskId(type: WhatsAppMessageTaskType, appointmentId: string): string {
     return `appointment-${type}-${appointmentId}`;
+  }
+
+  private normalizeAppointmentId(appointmentId: string): string {
+    const normalizedAppointmentId = appointmentId.trim();
+    if (normalizedAppointmentId === "") {
+      throw CustomError.badRequest("No se pueden gestionar tasks sin appointmentId");
+    }
+
+    return normalizedAppointmentId;
   }
 
   private computeDelaySeconds(date: string, time: string): number {

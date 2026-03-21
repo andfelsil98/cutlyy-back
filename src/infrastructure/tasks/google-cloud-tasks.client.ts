@@ -1,5 +1,6 @@
 import { CloudTasksClient, protos } from "@google-cloud/tasks";
 import { CustomError } from "../../domain/errors/custom-error";
+import { logger } from "../logger/logger";
 import type {
   CreateHttpTaskInput,
   CreateHttpTaskResult,
@@ -11,10 +12,12 @@ export interface GoogleCloudTasksConfig {
   projectId: string;
   location: string;
   queue: string;
+  maxAttempts: number;
 }
 
 export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
   private readonly client: CloudTasksClient;
+  private queueRetryConfigSyncPromise: Promise<void> | undefined;
 
   constructor(
     private readonly config: GoogleCloudTasksConfig,
@@ -31,6 +34,7 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
     const queue = this.config.queue.trim();
 
     const parent = this.client.queuePath(projectId, location, queue);
+    await this.ensureQueueRetryConfig(parent);
     const taskNameForRequest = this.resolveTaskName(projectId, location, queue, input.taskId);
     const task = this.buildTask(input, taskNameForRequest);
 
@@ -71,6 +75,89 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
         `No se pudo crear la task en Google Cloud Tasks. detalle=${details}`
       );
     }
+  }
+
+  async deleteTask(taskId: string): Promise<void> {
+    this.ensureConfigured();
+
+    const projectId = this.config.projectId.trim();
+    const location = this.config.location.trim();
+    const queue = this.config.queue.trim();
+    const taskName = this.resolveTaskName(projectId, location, queue, taskId);
+
+    if (taskName == null) {
+      throw CustomError.badRequest("No se puede eliminar una task sin taskId");
+    }
+
+    try {
+      await this.client.deleteTask({ name: taskName });
+    } catch (error) {
+      if (this.isNotFoundError(error)) {
+        return;
+      }
+
+      if (error instanceof CustomError) throw error;
+
+      const details =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : JSON.stringify(error);
+
+      throw CustomError.internalServerError(
+        `No se pudo eliminar la task en Google Cloud Tasks. detalle=${details}`
+      );
+    }
+  }
+
+  private async ensureQueueRetryConfig(queuePath: string): Promise<void> {
+    if (this.queueRetryConfigSyncPromise == null) {
+      this.queueRetryConfigSyncPromise = this.syncQueueRetryConfig(queuePath).catch((error) => {
+        this.queueRetryConfigSyncPromise = undefined;
+        throw error;
+      });
+    }
+
+    try {
+      await this.queueRetryConfigSyncPromise;
+    } catch (error) {
+      const details =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : JSON.stringify(error);
+
+      logger.warn(
+        `[GoogleCloudTasksQueueProvider] No se pudo sincronizar retryConfig de la cola ${queuePath}. detalle=${details}`
+      );
+    }
+  }
+
+  private async syncQueueRetryConfig(queuePath: string): Promise<void> {
+    const maxAttempts = this.normalizeMaxAttempts();
+    const [queue] = await this.client.getQueue({ name: queuePath });
+    const currentMaxAttempts = Number(queue.retryConfig?.maxAttempts ?? 0);
+
+    if (currentMaxAttempts === maxAttempts) return;
+
+    await this.client.updateQueue({
+      queue: {
+        name: queuePath,
+        retryConfig: {
+          ...(queue.retryConfig ?? {}),
+          maxAttempts,
+        },
+      },
+      updateMask: {
+        paths: ["retry_config.max_attempts"],
+      },
+    });
+
+    logger.info(
+      `[GoogleCloudTasksQueueProvider] retryConfig sincronizado. queue=${queuePath}, maxAttempts=${maxAttempts}`
+    );
   }
 
   private buildTask(
@@ -122,6 +209,17 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
     return task;
   }
 
+  private normalizeMaxAttempts(): number {
+    if (
+      Number.isFinite(this.config.maxAttempts) &&
+      Math.floor(this.config.maxAttempts) >= 1
+    ) {
+      return Math.floor(this.config.maxAttempts);
+    }
+
+    return 5;
+  }
+
   private resolveTaskName(
     projectId: string,
     location: string,
@@ -162,6 +260,27 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
     return message.toUpperCase().includes("ALREADY_EXISTS");
   }
 
+  private isNotFoundError(error: unknown): boolean {
+    const code =
+      typeof error === "object" &&
+      error != null &&
+      "code" in error &&
+      typeof (error as { code?: unknown }).code === "number"
+        ? (error as { code: number }).code
+        : undefined;
+
+    if (code === 5) return true;
+
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "";
+
+    return message.toUpperCase().includes("NOT_FOUND");
+  }
+
   private resolveHttpMethod(
     method: QueueHttpMethod
   ): protos.google.cloud.tasks.v2.HttpMethod {
@@ -198,6 +317,9 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
     if (this.isUnset(this.config.projectId)) missing.push("CLOUD_TASKS_PROJECT_ID");
     if (this.isUnset(this.config.location)) missing.push("CLOUD_TASKS_LOCATION");
     if (this.isUnset(this.config.queue)) missing.push("CLOUD_TASKS_QUEUE");
+    if (!Number.isFinite(this.config.maxAttempts) || Math.floor(this.config.maxAttempts) < 1) {
+      missing.push("CLOUD_TASKS_MAX_ATTEMPTS");
+    }
 
     if (missing.length > 0) {
       throw CustomError.internalServerError(

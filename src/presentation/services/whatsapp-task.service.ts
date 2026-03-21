@@ -1,12 +1,15 @@
 import type { WhatsAppMessageTaskType } from "../../config/whatsapp-message-types.config";
+import type { Business } from "../../domain/interfaces/business.interface";
 import type { Booking } from "../../domain/interfaces/booking.interface";
 import { CustomError } from "../../domain/errors/custom-error";
+import { logger } from "../../infrastructure/logger/logger";
 import FirestoreService from "./firestore.service";
 import { AppointmentService } from "./appointment.service";
 import { UserService } from "./user.service";
 import type { WhatsAppService } from "./whatsapp.service";
 
 const BOOKINGS_COLLECTION = "Bookings";
+const BUSINESSES_COLLECTION = "Businesses";
 
 export interface HandleWhatsAppTaskInput {
   type: WhatsAppMessageTaskType;
@@ -47,14 +50,21 @@ export class WhatsAppTaskService {
         input.appointmentId
       );
       let sentWhatsApp = false;
-      if (result.appointment.status === "FINISHED") {
-        const phone = await this.resolveClientPhoneByBookingId(result.appointment.bookingId);
-        if (phone != null) {
-          await this.whatsAppService.sendTemplateMessage({
-            to: phone,
-            templateType: "APPOINTMENT_COMPLETION",
-          });
-          sentWhatsApp = true;
+      if (result.changed && result.appointment.status === "FINISHED") {
+        const booking = await this.getBookingById(result.appointment.bookingId);
+        if (booking?.status === "FINISHED") {
+          try {
+            await this.sendBookingFinishedWhatsApp(booking);
+            sentWhatsApp = true;
+          } catch (error) {
+            if (!this.isNonRetryableWhatsAppError(error)) {
+              throw error;
+            }
+
+            logger.warn(
+              `[WhatsAppTaskService] WhatsApp no recuperable para appointment ${result.appointment.id}. bookingId=${result.appointment.bookingId}, detalle=${error.message}`
+            );
+          }
         }
       }
 
@@ -93,5 +103,60 @@ export class WhatsAppTaskService {
     const user = await this.userService.getByDocument(clientDocument);
     const phone = user?.phone?.trim() ?? "";
     return phone !== "" ? phone : null;
+  }
+
+  private async getBookingById(bookingId: string): Promise<Booking | null> {
+    const sanitizedBookingId = bookingId.trim();
+    if (sanitizedBookingId === "") return null;
+
+    try {
+      return await FirestoreService.getById<Booking>(
+        BOOKINGS_COLLECTION,
+        sanitizedBookingId
+      );
+    } catch (error) {
+      if (error instanceof CustomError && error.statusCode === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private async sendBookingFinishedWhatsApp(booking: Booking): Promise<void> {
+    const clientDocument = booking.clientId?.trim() ?? "";
+    if (clientDocument === "") return;
+
+    const [user, business] = await Promise.all([
+      this.userService.getByDocument(clientDocument),
+      FirestoreService.getById<Business>(BUSINESSES_COLLECTION, booking.businessId),
+    ]);
+    const phone = user?.phone?.trim() ?? "";
+    if (phone === "") return;
+
+    const businessName = business.name?.trim() || "Cutlyy";
+    const clientName = user?.name?.trim() || "cliente";
+    const consecutive = booking.consecutive?.trim() ?? "";
+    if (consecutive === "") return;
+
+    await this.whatsAppService.sendTemplateMessage({
+      to: phone,
+      templateType: "APPOINTMENT_COMPLETION",
+      headerPlaceholders: [businessName],
+      bodyPlaceholders: [clientName, consecutive],
+      buttons: [
+        {
+          type: "URL",
+          parameter: booking.id,
+        },
+      ],
+    });
+
+    logger.info(
+      `[WhatsAppTaskService] WhatsApp de finalizacion aceptado por Infobip. bookingId=${booking.id}, to=${phone}, templateType=APPOINTMENT_COMPLETION`
+    );
+  }
+
+  private isNonRetryableWhatsAppError(error: unknown): error is CustomError {
+    return error instanceof CustomError && error.code === "INFOBIP_MESSAGE_REJECTED";
   }
 }

@@ -1,4 +1,5 @@
 import { CustomError } from "../../../domain/errors/custom-error";
+import { validateConsecutivePrefix } from "../../../domain/utils/booking-consecutive.utils";
 import {
   normalizeSpaces,
   removeAccents,
@@ -14,6 +15,7 @@ import { validateCreateBranchItemDto } from "../../branch/dtos/create-branch.dto
 export interface UpdateBusinessDto {
   name?: string;
   type?: BusinessType;
+  consecutivePrefix?: string;
   logoUrl?: string;
   /** Generado si se envía name. */
   slug?: string;
@@ -57,6 +59,13 @@ export function validateUpdateBusinessDto(body: unknown): UpdateBusinessDto {
       );
     }
     result.type = type;
+  }
+
+  if (b.consecutivePrefix !== undefined) {
+    result.consecutivePrefix = validateConsecutivePrefix(
+      b.consecutivePrefix,
+      "consecutivePrefix"
+    );
   }
 
   const logoUrlRaw = b.logoUrl;
@@ -105,7 +114,7 @@ export function validateUpdateBusinessDto(body: unknown): UpdateBusinessDto {
 
   if (Object.keys(result).length === 0) {
     throw CustomError.badRequest(
-      "Se debe proporcionar al menos un campo (name, type, logoUrl, services, branches)"
+      "Se debe proporcionar al menos un campo (name, type, consecutivePrefix, logoUrl, services, branches)"
     );
   }
 

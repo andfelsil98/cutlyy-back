@@ -1,4 +1,5 @@
 import { CustomError } from "../../../domain/errors/custom-error";
+import { validateConsecutivePrefix } from "../../../domain/utils/booking-consecutive.utils";
 import {
   normalizeSpaces,
   removeAccents,
@@ -11,6 +12,7 @@ export type BusinessType = (typeof BUSINESS_TYPES)[number];
 export interface CreateBusinessDto {
   name: string;
   type: BusinessType;
+  consecutivePrefix: string;
   logoUrl?: string;
   /** Generado a partir de name en validateCreateBusinessDto. */
   slug: string;
@@ -48,6 +50,7 @@ export function validateCreateBusinessDto(body: unknown): CreateBusinessDto {
       `type debe ser uno de: ${BUSINESS_TYPES.join(", ")}`
     );
   }
+  const consecutivePrefix = validateConsecutivePrefix(b.consecutivePrefix);
   const logoUrlRaw = b.logoUrl;
   if (logoUrlRaw !== undefined && typeof logoUrlRaw !== "string") {
     throw CustomError.badRequest("logoUrl debe ser un texto cuando se proporcione");
@@ -57,6 +60,7 @@ export function validateCreateBusinessDto(body: unknown): CreateBusinessDto {
   return {
     name,
     type,
+    consecutivePrefix,
     ...(logoUrl !== undefined && logoUrl !== "" && { logoUrl }),
     slug: slugFromName(name),
   };

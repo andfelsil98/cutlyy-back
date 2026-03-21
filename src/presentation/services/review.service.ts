@@ -238,7 +238,7 @@ export class ReviewService {
     const reviews = await FirestoreService.getAll<Review>(COLLECTION_NAME, [
       { field: "appointmentId", operator: "==", value: appointmentId },
     ]);
-    await Promise.all(reviews.map((review) => this.deleteReview(review.id)));
+    await Promise.all(reviews.map((review) => this.deleteReviewWithData(review)));
   }
 
   async deleteReviewsByAppointmentIds(appointmentIds: string[]): Promise<void> {
@@ -249,11 +249,39 @@ export class ReviewService {
           .filter((appointmentId) => appointmentId !== "")
       )
     );
-    await Promise.all(
-      uniqueAppointmentIds.map((appointmentId) =>
-        this.deleteReviewsByAppointmentId(appointmentId)
+    if (uniqueAppointmentIds.length === 0) return;
+
+    const CHUNK_SIZE = 30;
+    const chunks: string[][] = [];
+    for (let i = 0; i < uniqueAppointmentIds.length; i += CHUNK_SIZE) {
+      chunks.push(uniqueAppointmentIds.slice(i, i + CHUNK_SIZE));
+    }
+
+    const results = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<Review>(COLLECTION_NAME, [
+          { field: "appointmentId", operator: "in", value: chunk },
+        ])
       )
     );
+
+    const allReviews = results.flat();
+    await Promise.all(allReviews.map((review) => this.deleteReviewWithData(review)));
+  }
+
+  private async deleteReviewWithData(review: Review): Promise<void> {
+    await FirestoreService.delete(COLLECTION_NAME, review.id);
+
+    if (review.targetType === "EMPLOYEE") {
+      await this.decrementEmployeeMembershipScore(
+        review.businessId,
+        review.targetId,
+        review.score
+      );
+    }
+    if (review.targetType === "BRANCH") {
+      await this.decrementBranchScore(review.businessId, review.branchId, review.score);
+    }
   }
 
   private async getBusinessOrFail(id: string): Promise<Business> {

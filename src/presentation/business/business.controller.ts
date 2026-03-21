@@ -5,6 +5,7 @@ import { validateUpdateBusinessDto } from "./dtos/update-business.dto";
 import type { BusinessService } from "../services/business.service";
 import { envs } from "../../config/envs";
 import { CustomError } from "../../domain/errors/custom-error";
+import { normalizeConsecutivePrefix } from "../../domain/utils/booking-consecutive.utils";
 
 export class BusinessController {
   constructor(private readonly businessService: BusinessService) {}
@@ -29,12 +30,18 @@ export class BusinessController {
       typeof req.query.slug === "string" && req.query.slug.trim() !== ""
         ? req.query.slug.trim().toLowerCase()
         : undefined;
+    const consecutivePrefix =
+      typeof req.query.consecutivePrefix === "string" &&
+      req.query.consecutivePrefix.trim() !== ""
+        ? normalizeConsecutivePrefix(req.query.consecutivePrefix)
+        : undefined;
     this.businessService
       .getAllBusinesses({
         page: pageRaw,
         pageSize,
         ...(id != null && { id }),
         ...(slug != null && { slug }),
+        ...(consecutivePrefix != null && { consecutivePrefix }),
       })
       .then((result) => {
         res.status(200).json(result);

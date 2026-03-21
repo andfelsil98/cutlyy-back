@@ -11,6 +11,17 @@ import {
   validateUpdateBookingDto,
 } from "./dtos/update-booking.dto";
 
+function parseIncludeDeletesQuery(value: unknown): boolean | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== "string") {
+    throw new Error("includeDeletes debe ser booleano (true o false)");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  throw new Error("includeDeletes debe ser true o false");
+}
+
 export class BookingController {
   constructor(private readonly bookingService: BookingService) {}
 
@@ -35,11 +46,24 @@ export class BookingController {
         typeof req.query.id === "string" && req.query.id.trim() !== ""
           ? req.query.id.trim()
           : undefined;
+      const businessId =
+        typeof req.query.businessId === "string" && req.query.businessId.trim() !== ""
+          ? req.query.businessId.trim()
+          : undefined;
+      const consecutive =
+        typeof req.query.consecutive === "string" &&
+        req.query.consecutive.trim() !== ""
+          ? req.query.consecutive.trim().toUpperCase()
+          : undefined;
+      const includeDeletes = parseIncludeDeletesQuery(req.query.includeDeletes);
       this.bookingService
         .getAllBookings({
           page: pageRaw,
           pageSize,
           ...(id != null && { id }),
+          ...(businessId != null && { businessId }),
+          ...(consecutive != null && { consecutive }),
+          ...(includeDeletes != null && { includeDeletes }),
         })
         .then((result) => {
           res.status(200).json(result);

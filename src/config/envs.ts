@@ -38,6 +38,10 @@ export const envs = {
     .get("CLOUD_TASKS_QUEUE")
     .default("REPLACE_ME_QUEUE")
     .asString(),
+  CLOUD_TASKS_MAX_ATTEMPTS: env
+    .get("CLOUD_TASKS_MAX_ATTEMPTS")
+    .default("5")
+    .asInt(),
   CLOUD_TASKS_TARGET_BASE_URL: env
     .get("CLOUD_TASKS_TARGET_BASE_URL")
     .default("http://localhost:3001")

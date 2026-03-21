@@ -29,6 +29,7 @@ export const PUBLIC_ROUTE_METHOD_PATHS: Array<{
   { method: "GET", path: "/api/business-memberships" },
   { method: "GET", path: "/api/users" },
   { method: "GET", path: "/api/reviews" },
+  { method: "GET", path: "/api/bookings", match: "prefix" },
   { method: "POST", path: "/api/reviews" },
   { method: "POST", path: "/api/bookings" },
   { method: "PUT", path: "/api/bookings", match: "prefix" },

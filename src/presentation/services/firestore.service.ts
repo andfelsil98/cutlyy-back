@@ -18,6 +18,8 @@ interface DocTimestamps {
   deletedAt?: Timestamp | null;
 }
 
+const SLOW_QUERY_THRESHOLD_MS = 500;
+
 function logUnexpectedError(error: unknown, context: string): void {
   const err = error instanceof Error ? error : new Error(String(error));
   const message = [
@@ -27,6 +29,21 @@ function logUnexpectedError(error: unknown, context: string): void {
     err.stack ?? "(no stack)",
   ].join("\n");
   logger.error(message);
+}
+
+function logQueryPerformance(
+  method: string,
+  collection: string,
+  startMs: number,
+  docCount?: number
+): void {
+  const elapsed = Date.now() - startMs;
+  if (elapsed >= SLOW_QUERY_THRESHOLD_MS) {
+    logger.warn(
+      `[FirestoreService] SLOW QUERY: ${method} on ${collection} took ${elapsed}ms` +
+        (docCount != null ? ` (${docCount} docs)` : "")
+    );
+  }
 }
 
 export default class FirestoreService {
@@ -60,9 +77,11 @@ export default class FirestoreService {
   static async getAll<T>(
     collectionName: string,
     filters: DbFilters[] = [],
-    orderBy?: { field: string; direction: "asc" | "desc" }
+    orderBy?: { field: string; direction: "asc" | "desc" },
+    selectFields?: string[]
   ): Promise<(T & { id: string })[]> {
     try {
+      const startMs = Date.now();
       let query: Query = this.getDB().collection(collectionName);
       filters.forEach(({ field, operator, value }) => {
         query = query.where(field, operator, value);
@@ -70,7 +89,11 @@ export default class FirestoreService {
       if (orderBy) {
         query = query.orderBy(orderBy.field, orderBy.direction);
       }
+      if (selectFields && selectFields.length > 0) {
+        query = query.select(...selectFields);
+      }
       const snapshot = await query.get();
+      logQueryPerformance("getAll", collectionName, startMs, snapshot.size);
       return snapshot.docs.map((doc) => {
         const data = doc.data() as T & DocTimestamps;
         const { createdAt, updatedAt, cancelledAt, deletedAt } = this.formatTimestamps(data);
@@ -98,15 +121,20 @@ export default class FirestoreService {
     orderBy: { field: string; direction: "asc" | "desc" } = {
       field: "createdAt",
       direction: "desc",
-    }
+    },
+    selectFields?: string[]
   ): Promise<PaginatedResult<T & { id: string }>> {
     try {
+      const startMs = Date.now();
       const db = this.getDB();
       let baseQuery: Query = db.collection(collectionName);
       filters.forEach(({ field, operator, value }) => {
         baseQuery = baseQuery.where(field, operator, value);
       });
       baseQuery = baseQuery.orderBy(orderBy.field, orderBy.direction);
+      if (selectFields && selectFields.length > 0) {
+        baseQuery = baseQuery.select(...selectFields);
+      }
 
       const countAgg = (baseQuery as Query & { count(): { get(): Promise<{ data(): { count: number } }> } }).count();
       const countSnap = await countAgg.get();
@@ -116,6 +144,7 @@ export default class FirestoreService {
       const offset = (page - 1) * pageSize;
       const paginatedQuery = baseQuery.limit(pageSize).offset(offset);
       const snapshot = await paginatedQuery.get();
+      logQueryPerformance("getAllPaginated", collectionName, startMs, snapshot.size);
 
       const data = snapshot.docs.map((doc) => {
         const docData = doc.data() as T & DocTimestamps;
@@ -230,15 +259,29 @@ export default class FirestoreService {
   static async getAllFromSubcollection<T>(
     parentCollection: string,
     parentId: string,
-    subcollectionName: string
+    subcollectionName: string,
+    options?: {
+      filters?: DbFilters[];
+      limit?: number;
+    }
   ): Promise<(T & { id: string })[]> {
     try {
       const db = this.getDB();
-      const snapshot = await db
+      let query: Query = db
         .collection(parentCollection)
         .doc(parentId)
-        .collection(subcollectionName)
-        .get();
+        .collection(subcollectionName);
+
+      if (options?.filters) {
+        for (const { field, operator, value } of options.filters) {
+          query = query.where(field, operator, value);
+        }
+      }
+      if (options?.limit != null && options.limit > 0) {
+        query = query.limit(options.limit);
+      }
+
+      const snapshot = await query.get();
 
       return snapshot.docs.map((doc) => {
         const data = doc.data() as T;

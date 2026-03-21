@@ -14,15 +14,15 @@ export interface WhatsAppTemplateConfig {
 
 export const WHATSAPP_TEMPLATES: Record<WhatsAppTemplateType, WhatsAppTemplateConfig> = {
   APPOINTMENT_CONFIRMATION: {
-    templateName: "booking_confirmation",
+    templateName: "book_confirmation",
     language: "es_CO",
   },
   APPOINTMENT_MODIFICATION: {
-    templateName: "booking_confirmation",
+    templateName: "book_cancellation",
     language: "es_CO",
   },
   APPOINTMENT_COMPLETION: {
-    templateName: "booking_confirmation",
+    templateName: "book_finished",
     language: "es_CO",
   },
 };

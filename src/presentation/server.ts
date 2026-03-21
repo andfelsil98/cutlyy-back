@@ -1,5 +1,5 @@
 import express, { Router } from "express";
-import { authMiddleware, errorHandler, notFoundRoute, requestLogger } from "../infrastructure";
+import { authMiddleware, errorHandler, notFoundRoute, rateLimitMiddleware, requestLogger } from "../infrastructure";
 import cors from "cors";
 import helmet from "helmet";
 
@@ -25,6 +25,7 @@ export class Server {
     this.app.use(express.json());
     this.app.use(express.urlencoded({ extended: true }));
     this.app.use(requestLogger);
+    this.app.use(rateLimitMiddleware);
     this.app.use(authMiddleware);
     this.app.use(this.routes);
     // Not found routes 

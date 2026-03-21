@@ -16,4 +16,5 @@ export interface CreateHttpTaskResult {
 
 export interface TaskQueueProvider {
   createHttpTask(input: CreateHttpTaskInput): Promise<CreateHttpTaskResult>;
+  deleteTask(taskId: string): Promise<void>;
 }

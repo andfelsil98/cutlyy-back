@@ -18,7 +18,10 @@ export class BookingRoutes {
         internalToken: envs.CLOUD_TASKS_INTERNAL_TOKEN,
       });
 
-    const appointmentService = new AppointmentService();
+    const appointmentService = new AppointmentService(
+      undefined,
+      appointmentStatusTaskScheduler
+    );
     const whatsAppService = createWhatsAppService();
     const bookingService = new BookingService(
       appointmentService,

@@ -12,6 +12,7 @@ export interface Booking {
   id: string;
   businessId: string;
   branchId: string;
+  consecutive: string;
   appointments: string[];
   clientId: string;
   status: BookingStatus;

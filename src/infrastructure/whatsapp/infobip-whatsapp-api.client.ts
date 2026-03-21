@@ -50,9 +50,17 @@ interface InfobipTemplateMessageRequest {
     templateName: string;
     language: string;
     templateData?: {
-      body: {
+      header?: {
+        type: "TEXT";
+        placeholder: string;
+      };
+      body?: {
         placeholders: string[];
       };
+      buttons?: Array<{
+        type: "URL";
+        parameter: string;
+      }>;
     };
   };
 }
@@ -67,6 +75,7 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const templateData = this.buildTemplateData(payload);
 
     const messageRequest: InfobipTemplateMessageRequest = {
       from: this.config.sender.trim(),
@@ -74,11 +83,9 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
       content: {
         templateName: payload.templateName,
         language: payload.language,
-        templateData: {
-          body: {
-            placeholders: payload.placeholders ?? [],
-          },
-        },
+        ...(templateData != null && {
+          templateData,
+        }),
       },
     };
 
@@ -126,7 +133,8 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
         throw CustomError.internalServerError(
           `Infobip devolvió un estado de rechazo. detalle=${this.extractProviderError(
             responseBody
-          )}. request=${this.buildRequestContext(messageRequest)}. body=${JSON.stringify(responseBody)}`
+          )}. request=${this.buildRequestContext(messageRequest)}. body=${JSON.stringify(responseBody)}`,
+          "INFOBIP_MESSAGE_REJECTED"
         );
       }
 
@@ -219,16 +227,53 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
   }
 
   private buildRequestContext(message: InfobipTemplateMessageRequest): string {
-    const placeholders = message.content.templateData?.body.placeholders ?? [];
+    const headerPlaceholder = message.content.templateData?.header?.placeholder;
+    const bodyPlaceholders = message.content.templateData?.body?.placeholders ?? [];
+    const buttons = message.content.templateData?.buttons ?? [];
 
     return JSON.stringify({
       to: message.to,
       from: message.from,
       templateName: message.content.templateName,
       language: message.content.language,
-      placeholdersCount: placeholders.length,
+      headerPlaceholdersCount: headerPlaceholder != null ? 1 : 0,
+      bodyPlaceholdersCount: bodyPlaceholders.length,
+      buttonsCount: buttons.length,
       hasTemplateData: message.content.templateData != null,
     });
+  }
+
+  private buildTemplateData(
+    payload: SendWhatsAppTemplateMessagePayload
+  ): InfobipTemplateMessageRequest["content"]["templateData"] | undefined {
+    const headerPlaceholders = payload.headerPlaceholders ?? [];
+    const bodyPlaceholders = payload.bodyPlaceholders ?? payload.placeholders ?? [];
+    const buttons = payload.buttons ?? [];
+
+    if (
+      headerPlaceholders.length === 0 &&
+      bodyPlaceholders.length === 0 &&
+      buttons.length === 0
+    ) {
+      return undefined;
+    }
+
+    return {
+      ...(headerPlaceholders.length > 0 && {
+        header: {
+          type: "TEXT" as const,
+          placeholder: headerPlaceholders[0]!,
+        },
+      }),
+      ...(bodyPlaceholders.length > 0 && {
+        body: {
+          placeholders: bodyPlaceholders,
+        },
+      }),
+      ...(buttons.length > 0 && {
+        buttons,
+      }),
+    };
   }
 
   private ensureConfigured(): void {
