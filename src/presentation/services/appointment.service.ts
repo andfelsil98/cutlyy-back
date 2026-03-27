@@ -6,7 +6,11 @@ import type {
   AppointmentStatus,
 } from "../../domain/interfaces/appointment.interface";
 import type { BusinessMembership } from "../../domain/interfaces/business-membership.interface";
-import type { Booking, BookingStatus } from "../../domain/interfaces/booking.interface";
+import type {
+  Booking,
+  BookingPaymentStatus,
+  BookingStatus,
+} from "../../domain/interfaces/booking.interface";
 import type { Branch } from "../../domain/interfaces/branch.interface";
 import type { Business } from "../../domain/interfaces/business.interface";
 import type {
@@ -25,6 +29,8 @@ import type { AppointmentStatusTaskScheduler } from "./appointment-status-task-s
 import { logger } from "../../infrastructure/logger/logger";
 import { MetricService } from "./metric.service";
 import { BookingConsecutiveService } from "./booking-consecutive.service";
+import type { WhatsAppService } from "./whatsapp.service";
+import { UserService } from "./user.service";
 
 const COLLECTION_NAME = "Appointments";
 const BOOKINGS_COLLECTION = "Bookings";
@@ -57,6 +63,29 @@ interface AppointmentMetricContext {
   date: string;
   status: AppointmentStatus;
   servicePrice: number;
+  paymentStatus: BookingPaymentStatus;
+}
+
+export interface BookingRevenueSnapshot {
+  bookingId: string;
+  businessId: string;
+  branchId: string;
+  paidAmount: number;
+  appointments: Array<{
+    id: string;
+    date: string;
+    startTime: string;
+    serviceId: string;
+    employeeId: string;
+    status: AppointmentStatus;
+  }>;
+}
+
+interface RevenueMetricContext {
+  businessId: string;
+  branchId: string;
+  employeeId: string;
+  date: string;
 }
 
 export interface CreateAppointmentForBookingData {
@@ -91,6 +120,11 @@ type AppointmentStored = {
 
 export interface UpdateAppointmentOptions {
   branchIdOverride?: string;
+  skipBookingSync?: boolean;
+}
+
+export interface SetAppointmentStatusOptions {
+  skipBookingSync?: boolean;
 }
 
 export class AppointmentService {
@@ -101,7 +135,9 @@ export class AppointmentService {
     private readonly appointmentStatusTaskScheduler?: AppointmentStatusTaskScheduler,
     private readonly metricService: MetricService = new MetricService(),
     private readonly bookingConsecutiveService: BookingConsecutiveService =
-      new BookingConsecutiveService()
+      new BookingConsecutiveService(),
+    private readonly whatsAppService?: WhatsAppService,
+    private readonly userService: UserService = new UserService()
   ) {}
 
   clearValidationCache(): void {
@@ -240,6 +276,9 @@ export class AppointmentService {
           BOOKINGS_COLLECTION,
           dto.bookingId
         );
+        const beforeRevenueSnapshot = await this.captureBookingRevenueSnapshot(
+          booking.id
+        );
         if (booking.status !== "CREATED") {
           throw CustomError.badRequest(
             "Solo se pueden agregar citas a bookings con estado CREATED"
@@ -278,16 +317,22 @@ export class AppointmentService {
             ? booking.paidAmount
             : 0;
         const nextTotalAmount = currentTotalAmount + service.price;
+        const nextPaymentStatus = this.resolveBookingPaymentStatus(
+          nextTotalAmount,
+          currentPaidAmount
+        );
 
         await FirestoreService.update(BOOKINGS_COLLECTION, booking.id, {
           appointments: nextAppointments,
           totalAmount: nextTotalAmount,
-          paymentStatus: this.resolveBookingPaymentStatus(
-            nextTotalAmount,
-            currentPaidAmount
-          ),
+          paymentStatus: nextPaymentStatus,
           updatedAt: FirestoreDataBase.generateTimeStamp(),
         });
+
+        await this.syncBookingRevenueMetricsFromSnapshot(
+          booking.id,
+          beforeRevenueSnapshot
+        );
 
         return createdAppointment;
       }
@@ -349,6 +394,8 @@ export class AppointmentService {
         updatedAt: FirestoreDataBase.generateTimeStamp(),
       });
 
+      await this.syncBookingRevenueMetricsFromSnapshot(createdBooking.id, null);
+
       await this.scheduleStatusTasksForCreatedAppointment(createdAppointment).catch((taskError) => {
         const detail =
           taskError instanceof Error
@@ -359,6 +406,24 @@ export class AppointmentService {
 
         logger.warn(
           `[AppointmentService] No se pudieron crear tasks automáticas para appointment ${createdAppointment.id}. detalle=${detail}`
+        );
+      });
+
+      await this.sendBookingCreatedWhatsApp(
+        createdBooking.id,
+        dto.businessId,
+        consecutive,
+        dto.clientId
+      ).catch((whatsAppError) => {
+        const detail =
+          whatsAppError instanceof Error
+            ? whatsAppError.message
+            : typeof whatsAppError === "string"
+              ? whatsAppError
+              : JSON.stringify(whatsAppError);
+
+        logger.warn(
+          `[AppointmentService] No se pudo enviar WhatsApp de confirmación para booking ${createdBooking.id}. detalle=${detail}`
         );
       });
 
@@ -397,6 +462,7 @@ export class AppointmentService {
         BOOKINGS_COLLECTION,
         data.bookingId
       );
+      const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
       if (booking.status === "DELETED") {
         throw CustomError.badRequest(
           "No se puede crear una cita para un booking eliminado"
@@ -458,6 +524,7 @@ export class AppointmentService {
         date: data.date,
         status: "CREATED",
         servicePrice: service.price,
+        paymentStatus: bookingPaymentStatus,
       });
 
       return createdAppointment;
@@ -503,14 +570,24 @@ export class AppointmentService {
     opts?: UpdateAppointmentOptions
   ): Promise<Appointment> {
     try {
+      const existingAppointment = await this.getStoredAppointmentById(id);
+      if (dto.status === "CANCELLED") {
+        return await this.cancelAppointment(id);
+      }
+      if (dto.status === "FINISHED") {
+        return await this.setAppointmentStatus(id, "FINISHED");
+      }
+
+      const isRestoringCancelledAppointment =
+        dto.status === "CREATED" && existingAppointment.status === "CANCELLED";
       this.ensureAppointmentDateTimeIsNotPast(dto.date, dto.startTime);
 
-      const existingAppointment = await this.getStoredAppointmentById(id);
       if (
-        existingAppointment.status === "IN_PROGRESS" ||
-        existingAppointment.status === "DELETED" ||
-        existingAppointment.status === "CANCELLED" ||
-        existingAppointment.status === "FINISHED"
+        !isRestoringCancelledAppointment &&
+        (existingAppointment.status === "IN_PROGRESS" ||
+          existingAppointment.status === "DELETED" ||
+          existingAppointment.status === "CANCELLED" ||
+          existingAppointment.status === "FINISHED")
       ) {
         throw CustomError.badRequest(
           "No se puede editar una cita con estado IN_PROGRESS, FINISHED, DELETED o CANCELLED"
@@ -525,6 +602,11 @@ export class AppointmentService {
       }
 
       const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+      const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+      const beforeRevenueSnapshot =
+        opts?.skipBookingSync === true
+          ? null
+          : await this.captureBookingRevenueSnapshot(booking.id);
       if (booking.status === "DELETED") {
         throw CustomError.badRequest("No se puede editar una cita de un booking eliminado");
       }
@@ -560,14 +642,16 @@ export class AppointmentService {
         existingAppointment.serviceId ?? dto.serviceId,
         booking.businessId
       );
+      const currentStatus = existingAppointment.status;
 
       const beforeMetricContext = {
         businessId: booking.businessId,
         branchId: booking.branchId,
         employeeId: existingAppointment.employeeId ?? dto.employeeId,
         date: this.normalizeStoredDate(existingAppointment.date, dto.date),
-        status: existingAppointment.status,
+        status: currentStatus,
         servicePrice: previousServicePrice,
+        paymentStatus: bookingPaymentStatus,
       };
 
       const payload: Record<string, unknown> = {
@@ -585,7 +669,13 @@ export class AppointmentService {
       };
 
       await FirestoreService.update(COLLECTION_NAME, id, payload);
-      await this.syncBookingStatusFromAppointments(booking.id);
+      if (opts?.skipBookingSync !== true) {
+        await this.syncBookingStatusFromAppointments(booking.id);
+        await this.syncBookingRevenueMetricsFromSnapshot(
+          booking.id,
+          beforeRevenueSnapshot
+        );
+      }
 
       await this.applyAppointmentMetricTransition(beforeMetricContext, {
         businessId: booking.businessId,
@@ -594,6 +684,7 @@ export class AppointmentService {
         date: dto.date,
         status: "CREATED",
         servicePrice: nextService.price,
+        paymentStatus: bookingPaymentStatus,
       });
 
       const updated = await FirestoreService.getById<AppointmentStored>(
@@ -614,7 +705,27 @@ export class AppointmentService {
     }
   }
 
-  async cancelAppointment(id: string): Promise<Appointment> {
+  async setAppointmentStatus(
+    id: string,
+    status: Exclude<AppointmentStatus, "IN_PROGRESS">,
+    opts?: SetAppointmentStatusOptions
+  ): Promise<Appointment> {
+    if (status === "CREATED") {
+      return this.restoreAppointmentToCreated(id, opts);
+    }
+    if (status === "CANCELLED") {
+      return this.cancelAppointment(id, opts);
+    }
+    if (status === "DELETED") {
+      return this.deleteAppointment(id, opts);
+    }
+    return this.finishAppointment(id, opts);
+  }
+
+  async cancelAppointment(
+    id: string,
+    opts?: SetAppointmentStatusOptions
+  ): Promise<Appointment> {
     try {
       const existingAppointment = await this.getStoredAppointmentById(id);
       if (existingAppointment.status === "DELETED") {
@@ -636,6 +747,11 @@ export class AppointmentService {
       }
 
       const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+      const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+      const beforeRevenueSnapshot =
+        opts?.skipBookingSync === true
+          ? null
+          : await this.captureBookingRevenueSnapshot(booking.id);
       const beforeServicePrice = await this.getServicePriceById(
         existingAppointment.serviceId ?? "",
         booking.businessId
@@ -647,7 +763,13 @@ export class AppointmentService {
         updatedAt: FirestoreDataBase.generateTimeStamp(),
       });
 
-      await this.syncBookingStatusFromAppointments(bookingId);
+      if (opts?.skipBookingSync !== true) {
+        await this.syncBookingStatusFromAppointments(bookingId);
+        await this.syncBookingRevenueMetricsFromSnapshot(
+          booking.id,
+          beforeRevenueSnapshot
+        );
+      }
 
       await this.applyAppointmentMetricTransition(
         {
@@ -657,6 +779,7 @@ export class AppointmentService {
           date: this.normalizeStoredDate(existingAppointment.date),
           status: existingAppointment.status,
           servicePrice: beforeServicePrice,
+          paymentStatus: bookingPaymentStatus,
         },
         {
           businessId: booking.businessId,
@@ -665,6 +788,7 @@ export class AppointmentService {
           date: this.normalizeStoredDate(existingAppointment.date),
           status: "CANCELLED",
           servicePrice: beforeServicePrice,
+          paymentStatus: bookingPaymentStatus,
         }
       );
 
@@ -678,7 +802,10 @@ export class AppointmentService {
     }
   }
 
-  async deleteAppointment(id: string): Promise<Appointment> {
+  async deleteAppointment(
+    id: string,
+    opts?: SetAppointmentStatusOptions
+  ): Promise<Appointment> {
     try {
       const existingAppointment = await this.getStoredAppointmentById(id);
       if (existingAppointment.status === "DELETED") {
@@ -691,6 +818,11 @@ export class AppointmentService {
       }
 
       const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+      const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+      const beforeRevenueSnapshot =
+        opts?.skipBookingSync === true
+          ? null
+          : await this.captureBookingRevenueSnapshot(booking.id);
       const beforeServicePrice = await this.getServicePriceById(
         existingAppointment.serviceId ?? "",
         booking.businessId
@@ -703,7 +835,13 @@ export class AppointmentService {
         deletedAt: FirestoreDataBase.generateTimeStamp(),
       });
 
-      await this.syncBookingStatusFromAppointments(bookingId);
+      if (opts?.skipBookingSync !== true) {
+        await this.syncBookingStatusFromAppointments(bookingId);
+        await this.syncBookingRevenueMetricsFromSnapshot(
+          booking.id,
+          beforeRevenueSnapshot
+        );
+      }
 
       await this.applyAppointmentMetricTransition(
         {
@@ -713,6 +851,7 @@ export class AppointmentService {
           date: this.normalizeStoredDate(existingAppointment.date),
           status: existingAppointment.status,
           servicePrice: beforeServicePrice,
+          paymentStatus: bookingPaymentStatus,
         },
         null
       );
@@ -762,57 +901,234 @@ export class AppointmentService {
     if (mapped.status !== "IN_PROGRESS") {
       return { appointment: mapped, changed: false };
     }
-
-    const bookingId = mapped.bookingId.trim();
-    if (bookingId === "") {
-      throw CustomError.badRequest("La cita no está vinculada a un booking");
-    }
-
-    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
-    const servicePrice = await this.getServicePriceById(mapped.serviceId, booking.businessId);
-
-    await FirestoreService.update(COLLECTION_NAME, mapped.id, {
-      status: "FINISHED",
-      updatedAt: FirestoreDataBase.generateTimeStamp(),
-      cancelledAt: FieldValue.delete(),
-      deletedAt: FieldValue.delete(),
-    });
-
-    await this.syncBookingStatusFromAppointments(bookingId);
-
-    await this.applyAppointmentMetricTransition(
-      {
-        businessId: booking.businessId,
-        branchId: booking.branchId,
-        employeeId: mapped.employeeId,
-        date: mapped.date,
-        status: "IN_PROGRESS",
-        servicePrice,
-      },
-      {
-        businessId: booking.businessId,
-        branchId: booking.branchId,
-        employeeId: mapped.employeeId,
-        date: mapped.date,
-        status: "FINISHED",
-        servicePrice,
-      }
-    );
-
-    const updated = await this.getStoredAppointmentById(mapped.id);
     return {
-      appointment: this.mapAppointmentToResponse(updated),
+      appointment: await this.finishAppointment(id),
       changed: true,
     };
   }
+
+  async captureBookingRevenueSnapshot(
+    bookingId: string
+  ): Promise<BookingRevenueSnapshot | null> {
+    try {
+      const [booking, appointments] = await Promise.all([
+        FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId),
+        FirestoreService.getAll<AppointmentStored>(COLLECTION_NAME, [
+          { field: "bookingId", operator: "==", value: bookingId },
+        ]),
+      ]);
+
+      return {
+        bookingId: booking.id,
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        paidAmount:
+          Number.isFinite(booking.paidAmount) && booking.paidAmount >= 0
+            ? booking.paidAmount
+            : 0,
+        appointments: appointments.map((appointment) => {
+          const mappedAppointment = this.mapAppointmentToResponse(appointment);
+          return {
+            id: mappedAppointment.id,
+            date: mappedAppointment.date,
+            startTime: mappedAppointment.startTime,
+            serviceId: mappedAppointment.serviceId,
+            employeeId: mappedAppointment.employeeId,
+            status: mappedAppointment.status,
+          };
+        }),
+      };
+    } catch (error) {
+      if (error instanceof CustomError && error.statusCode === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async syncBookingRevenueMetricsFromSnapshot(
+    bookingId: string,
+    beforeSnapshot: BookingRevenueSnapshot | null
+  ): Promise<void> {
+    const afterSnapshot = await this.captureBookingRevenueSnapshot(bookingId);
+
+    const [beforeContributions, afterContributions] = await Promise.all([
+      this.buildRevenueContributionsByAppointment(beforeSnapshot),
+      this.buildRevenueContributionsByAppointment(afterSnapshot),
+    ]);
+
+    const deltasByContext = new Map<
+      string,
+      { context: RevenueMetricContext; revenueDelta: number }
+    >();
+
+    const appointmentIds = new Set<string>([
+      ...beforeContributions.keys(),
+      ...afterContributions.keys(),
+    ]);
+
+    for (const appointmentId of appointmentIds) {
+      const beforeContribution = beforeContributions.get(appointmentId);
+      const afterContribution = afterContributions.get(appointmentId);
+
+      if (beforeContribution != null) {
+        this.accumulateRevenueMetricDelta(
+          deltasByContext,
+          beforeContribution.context,
+          -beforeContribution.revenue
+        );
+      }
+
+      if (afterContribution != null) {
+        this.accumulateRevenueMetricDelta(
+          deltasByContext,
+          afterContribution.context,
+          afterContribution.revenue
+        );
+      }
+    }
+
+    for (const { context, revenueDelta } of deltasByContext.values()) {
+      const normalizedDelta = this.roundMoney(revenueDelta);
+      if (normalizedDelta === 0) continue;
+
+      await this.metricService.applyAppointmentMetricDelta({
+        businessId: context.businessId,
+        branchId: context.branchId,
+        employeeId: context.employeeId,
+        date: context.date,
+        revenueDelta: normalizedDelta,
+      });
+    }
+  }
+
+  private async buildRevenueContributionsByAppointment(
+    snapshot: BookingRevenueSnapshot | null
+  ): Promise<Map<string, { context: RevenueMetricContext; revenue: number }>> {
+    const contributions = new Map<
+      string,
+      { context: RevenueMetricContext; revenue: number }
+    >();
+
+    if (snapshot == null || snapshot.paidAmount <= 0 || snapshot.appointments.length === 0) {
+      return contributions;
+    }
+
+    const services = await FirestoreService.getAll<Service>(SERVICES_COLLECTION, [
+      { field: "businessId", operator: "==", value: snapshot.businessId },
+    ]);
+    const servicePricesById = new Map(
+      services.map((service) => [service.id.trim(), Math.max(0, service.price ?? 0)] as const)
+    );
+
+    const activeAppointments = snapshot.appointments
+      .filter((appointment) => this.isRevenueBookingStatus(appointment.status))
+      .map((appointment) => ({
+        appointment,
+        price: servicePricesById.get(appointment.serviceId.trim()) ?? 0,
+      }))
+      .filter(({ price }) => price > 0)
+      .sort((a, b) => {
+        if (a.appointment.date !== b.appointment.date) {
+          return a.appointment.date.localeCompare(b.appointment.date);
+        }
+        if (a.appointment.startTime !== b.appointment.startTime) {
+          return a.appointment.startTime.localeCompare(b.appointment.startTime);
+        }
+        return a.appointment.id.localeCompare(b.appointment.id);
+      });
+
+    if (activeAppointments.length === 0) {
+      return contributions;
+    }
+
+    const totalActiveAmount = activeAppointments.reduce(
+      (sum, item) => sum + item.price,
+      0
+    );
+    if (totalActiveAmount <= 0) {
+      return contributions;
+    }
+
+    const totalPaidToDistribute = this.roundMoney(
+      Math.min(snapshot.paidAmount, totalActiveAmount)
+    );
+    if (totalPaidToDistribute <= 0) {
+      return contributions;
+    }
+
+    let distributedAmount = 0;
+    activeAppointments.forEach((item, index) => {
+      const isLast = index === activeAppointments.length - 1;
+      const revenue = isLast
+        ? this.roundMoney(totalPaidToDistribute - distributedAmount)
+        : this.roundMoney((totalPaidToDistribute * item.price) / totalActiveAmount);
+      const normalizedRevenue = Math.max(0, revenue);
+      distributedAmount = this.roundMoney(distributedAmount + normalizedRevenue);
+
+      if (normalizedRevenue === 0) return;
+
+      contributions.set(item.appointment.id, {
+        context: {
+          businessId: snapshot.businessId,
+          branchId: snapshot.branchId,
+          employeeId: item.appointment.employeeId,
+          date: item.appointment.date,
+        },
+        revenue: normalizedRevenue,
+      });
+    });
+
+    return contributions;
+  }
+
+  private accumulateRevenueMetricDelta(
+    deltasByContext: Map<
+      string,
+      { context: RevenueMetricContext; revenueDelta: number }
+    >,
+    context: RevenueMetricContext,
+    revenueDelta: number
+  ): void {
+    const key = [
+      context.businessId.trim(),
+      context.branchId.trim(),
+      context.employeeId.trim(),
+      context.date.trim(),
+    ].join("|");
+
+    const existing = deltasByContext.get(key);
+    if (existing == null) {
+      deltasByContext.set(key, {
+        context,
+        revenueDelta,
+      });
+      return;
+    }
+
+    existing.revenueDelta += revenueDelta;
+  }
+
   private async applyAppointmentMetricTransition(
     before: AppointmentMetricContext | null,
     after: AppointmentMetricContext | null
   ): Promise<void> {
     const beforeContribution =
-      before == null ? null : this.resolveMetricContribution(before.status, before.servicePrice);
+      before == null
+        ? null
+        : this.resolveMetricContribution(
+            before.status,
+            before.servicePrice,
+            before.paymentStatus
+          );
     const afterContribution =
-      after == null ? null : this.resolveMetricContribution(after.status, after.servicePrice);
+      after == null
+        ? null
+        : this.resolveMetricContribution(
+            after.status,
+            after.servicePrice,
+            after.paymentStatus
+          );
 
     const deltasByContext = new Map<
       string,
@@ -928,7 +1244,8 @@ export class AppointmentService {
 
   private resolveMetricContribution(
     status: AppointmentStatus,
-    servicePrice: number
+    servicePrice: number,
+    paymentStatus: BookingPaymentStatus
   ): {
     revenueDelta: number;
     appointmentsDelta: number;
@@ -944,11 +1261,8 @@ export class AppointmentService {
       };
     }
 
-    const isRevenueStatus =
-      status === "CREATED" || status === "IN_PROGRESS" || status === "FINISHED";
-
     return {
-      revenueDelta: isRevenueStatus ? Math.max(0, servicePrice) : 0,
+      revenueDelta: 0,
       appointmentsDelta: 1,
       completedAppointmentsDelta: status === "FINISHED" ? 1 : 0,
       cancelledAppointmentsDelta: status === "CANCELLED" ? 1 : 0,
@@ -1069,6 +1383,47 @@ export class AppointmentService {
     }
   }
 
+  private async sendBookingCreatedWhatsApp(
+    bookingId: string,
+    businessId: string,
+    bookingConsecutive: string,
+    clientDocument: string,
+    opts?: { cachedBusiness?: Business }
+  ): Promise<void> {
+    if (this.whatsAppService == null) return;
+
+    const sanitizedDocument = clientDocument.trim();
+    if (sanitizedDocument === "") return;
+
+    const [user, business] = await Promise.all([
+      this.userService.getByDocument(sanitizedDocument),
+      opts?.cachedBusiness
+        ? Promise.resolve(opts.cachedBusiness)
+        : FirestoreService.getById<Business>(BUSINESS_COLLECTION, businessId),
+    ]);
+    const phone = user?.phone?.trim() ?? "";
+    if (phone === "") return;
+    const businessName = business.name?.trim() || "Cutlyy";
+    const clientName = user?.name?.trim() || "cliente";
+
+    const sendResult = await this.whatsAppService.sendTemplateMessage({
+      to: phone,
+      templateType: "APPOINTMENT_CONFIRMATION",
+      headerPlaceholders: [businessName],
+      bodyPlaceholders: [clientName, bookingConsecutive],
+      buttons: [
+        {
+          type: "URL",
+          parameter: bookingId,
+        },
+      ],
+    });
+
+    logger.info(
+      `[AppointmentService] WhatsApp de confirmacion aceptado por Infobip. bookingId=${bookingId}, to=${phone}, templateType=APPOINTMENT_CONFIRMATION, messageId=${sendResult.messageId}`
+    );
+  }
+
   private async getStoredAppointmentById(id: string): Promise<AppointmentStored> {
     const appointments = await FirestoreService.getAll<AppointmentStored>(
       COLLECTION_NAME,
@@ -1092,10 +1447,17 @@ export class AppointmentService {
       if (appointments.length === 0) return;
 
       const now = FirestoreDataBase.generateTimeStamp();
+      const nextTotalAmount = await this.calculateBookingTotalPrice(
+        booking.businessId,
+        appointments
+      );
       const payload: Record<string, unknown> = {
-        totalAmount: await this.calculateBookingTotalPrice(
-          booking.businessId,
-          appointments
+        totalAmount: nextTotalAmount,
+        paymentStatus: this.resolveBookingPaymentStatus(
+          nextTotalAmount,
+          Number.isFinite(booking.paidAmount) && booking.paidAmount >= 0
+            ? booking.paidAmount
+            : 0
         ),
         updatedAt: now,
       };
@@ -1274,7 +1636,7 @@ export class AppointmentService {
     return branch;
   }
 
-  private async ensureServiceExistsInBusiness(
+  async ensureServiceExistsInBusiness(
     serviceId: string,
     businessId: string
   ): Promise<Service> {
@@ -1296,10 +1658,26 @@ export class AppointmentService {
     return service;
   }
 
-  private async ensureEmployeeIsActiveInBusiness(
+  async ensureEmployeeIsActiveInBusiness(
     employeeId: string,
     businessId: string
   ): Promise<void> {
+    const isValidEmployee = await this.isEmployeeActiveInBusiness(
+      employeeId,
+      businessId
+    );
+
+    if (!isValidEmployee) {
+      throw CustomError.badRequest(
+        "employeeId debe pertenecer a una membresía ACTIVE con isEmployee=true en este negocio"
+      );
+    }
+  }
+
+  private async isEmployeeActiveInBusiness(
+    employeeId: string,
+    businessId: string
+  ): Promise<boolean> {
     const [memberships, usersById, usersByDocument] = await Promise.all([
       FirestoreService.getAll<BusinessMembership>(BUSINESS_MEMBERSHIPS_COLLECTION, [
         { field: "businessId", operator: "==", value: businessId },
@@ -1330,12 +1708,221 @@ export class AppointmentService {
         membership.status === "ACTIVE" &&
         membership.isEmployee === true
     );
+    return isValidEmployee;
+  }
 
-    if (!isValidEmployee) {
+  private async restoreAppointmentToCreated(
+    id: string,
+    opts?: SetAppointmentStatusOptions
+  ): Promise<Appointment> {
+    const existingAppointment = await this.getStoredAppointmentById(id);
+    if (existingAppointment.status === "DELETED") {
+      throw CustomError.badRequest("No se puede cambiar el estado de una cita eliminada");
+    }
+    if (existingAppointment.status === "FINISHED") {
       throw CustomError.badRequest(
-        "employeeId debe pertenecer a una membresía ACTIVE con isEmployee=true en este negocio"
+        "No se puede cambiar el estado de una cita finalizada"
       );
     }
+    if (existingAppointment.status === "IN_PROGRESS") {
+      throw CustomError.badRequest(
+        "No se puede cambiar el estado de una cita en curso"
+      );
+    }
+
+    const bookingId = existingAppointment.bookingId?.trim() ?? "";
+    if (bookingId === "") {
+      throw CustomError.badRequest("La cita no está vinculada a un booking");
+    }
+
+    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+    const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+    const beforeRevenueSnapshot =
+      opts?.skipBookingSync === true
+        ? null
+        : await this.captureBookingRevenueSnapshot(booking.id);
+    if (booking.status === "DELETED") {
+      throw CustomError.badRequest("No se puede editar una cita de un booking eliminado");
+    }
+
+    const mapped = this.mapAppointmentToResponse(existingAppointment);
+    await this.ensureBusinessAndBranch(booking.businessId, booking.branchId);
+    const service = await this.ensureServiceExistsInBusiness(
+      mapped.serviceId,
+      booking.businessId
+    );
+    await this.ensureEmployeeIsActiveInBusiness(mapped.employeeId, booking.businessId);
+
+    if (existingAppointment.status === "CREATED") {
+      return mapped;
+    }
+
+    await FirestoreService.update(COLLECTION_NAME, id, {
+      status: "CREATED",
+      updatedAt: FirestoreDataBase.generateTimeStamp(),
+      cancelledAt: FieldValue.delete(),
+      deletedAt: FieldValue.delete(),
+    });
+
+    if (opts?.skipBookingSync !== true) {
+      await this.syncBookingStatusFromAppointments(bookingId);
+      await this.syncBookingRevenueMetricsFromSnapshot(
+        booking.id,
+        beforeRevenueSnapshot
+      );
+    }
+
+    await this.applyAppointmentMetricTransition(
+      {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: mapped.employeeId,
+        date: mapped.date,
+        status: existingAppointment.status,
+        servicePrice: service.price,
+        paymentStatus: bookingPaymentStatus,
+      },
+      {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: mapped.employeeId,
+        date: mapped.date,
+        status: "CREATED",
+        servicePrice: service.price,
+        paymentStatus: bookingPaymentStatus,
+      }
+    );
+
+    const restored = await this.getStoredAppointmentById(id);
+    const mappedRestored = this.mapAppointmentToResponse(restored);
+    await this.rescheduleStatusTasksForAppointment(
+      mappedRestored,
+      "marcar en CREATED"
+    );
+    return mappedRestored;
+  }
+
+  private async finishAppointment(
+    id: string,
+    opts?: SetAppointmentStatusOptions
+  ): Promise<Appointment> {
+    const existingAppointment = await this.getStoredAppointmentById(id);
+    if (existingAppointment.status === "DELETED") {
+      throw CustomError.badRequest("No se puede finalizar una cita eliminada");
+    }
+    if (existingAppointment.status === "FINISHED") {
+      return this.mapAppointmentToResponse(existingAppointment);
+    }
+
+    const mapped = this.mapAppointmentToResponse(existingAppointment);
+    const bookingId = mapped.bookingId.trim();
+    if (bookingId === "") {
+      throw CustomError.badRequest("La cita no está vinculada a un booking");
+    }
+
+    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+    const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+    const servicePrice = await this.getServicePriceById(
+      mapped.serviceId,
+      booking.businessId
+    ).catch((error) => {
+      if (error instanceof CustomError && error.statusCode === 404) {
+        return 0;
+      }
+      throw error;
+    });
+    const includeFinishedMetrics = await this.shouldCountAppointmentInMetrics({
+      businessId: booking.businessId,
+      branchId: booking.branchId,
+      serviceId: mapped.serviceId,
+      employeeId: mapped.employeeId,
+    });
+
+    await FirestoreService.update(COLLECTION_NAME, mapped.id, {
+      status: "FINISHED",
+      updatedAt: FirestoreDataBase.generateTimeStamp(),
+      cancelledAt: FieldValue.delete(),
+      deletedAt: FieldValue.delete(),
+    });
+
+    if (opts?.skipBookingSync !== true) {
+      await this.syncBookingStatusFromAppointments(bookingId);
+    }
+
+    await this.applyAppointmentMetricTransition(
+      {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: mapped.employeeId,
+        date: mapped.date,
+        status: existingAppointment.status,
+        servicePrice,
+        paymentStatus: bookingPaymentStatus,
+      },
+      includeFinishedMetrics
+        ? {
+            businessId: booking.businessId,
+            branchId: booking.branchId,
+            employeeId: mapped.employeeId,
+            date: mapped.date,
+            status: "FINISHED",
+            servicePrice,
+            paymentStatus: bookingPaymentStatus,
+          }
+        : null
+    );
+
+    await this.deleteStatusTasksForAppointment(id, "marcar en FINISHED");
+
+    const updated = await this.getStoredAppointmentById(mapped.id);
+    return this.mapAppointmentToResponse(updated);
+  }
+
+  private async shouldCountAppointmentInMetrics(input: {
+    businessId: string;
+    branchId: string;
+    serviceId: string;
+    employeeId: string;
+  }): Promise<boolean> {
+    const [branchIsActive, serviceIsActive, employeeIsActive] = await Promise.all([
+      this.isBranchActiveInBusiness(input.branchId, input.businessId),
+      this.isServiceActiveInBusiness(input.serviceId, input.businessId),
+      this.isEmployeeActiveInBusiness(input.employeeId, input.businessId),
+    ]);
+
+    return branchIsActive && serviceIsActive && employeeIsActive;
+  }
+
+  private async isBranchActiveInBusiness(
+    branchId: string,
+    businessId: string
+  ): Promise<boolean> {
+    const normalizedBranchId = branchId.trim();
+    if (normalizedBranchId === "") return false;
+
+    const branches = await FirestoreService.getAll<Branch>(BRANCH_COLLECTION, [
+      { field: "id", operator: "==", value: normalizedBranchId },
+    ]);
+    if (branches.length === 0) return false;
+
+    const branch = branches[0]!;
+    return branch.businessId === businessId && branch.status !== "DELETED";
+  }
+
+  private async isServiceActiveInBusiness(
+    serviceId: string,
+    businessId: string
+  ): Promise<boolean> {
+    const normalizedServiceId = serviceId.trim();
+    if (normalizedServiceId === "") return false;
+
+    const services = await FirestoreService.getAll<Service>(SERVICES_COLLECTION, [
+      { field: "id", operator: "==", value: normalizedServiceId },
+    ]);
+    if (services.length === 0) return false;
+
+    const service = services[0]!;
+    return service.businessId === businessId && service.status !== "DELETED";
   }
 
   private async ensureNoEmployeeScheduleConflict(
@@ -1628,6 +2215,33 @@ export class AppointmentService {
         updatedAt: appointment.updatedAt,
       }),
     };
+  }
+
+  private isRevenueBookingStatus(status: AppointmentStatus): boolean {
+    return (
+      status === "CREATED" ||
+      status === "IN_PROGRESS" ||
+      status === "FINISHED"
+    );
+  }
+
+  private roundMoney(value: number): number {
+    return Math.round((value + Number.EPSILON) * 100) / 100;
+  }
+
+  private resolveBookingPaymentStatusFromBooking(
+    booking: Booking
+  ): BookingPaymentStatus {
+    const totalAmount =
+      Number.isFinite(booking.totalAmount) && booking.totalAmount >= 0
+        ? booking.totalAmount
+        : 0;
+    const paidAmount =
+      Number.isFinite(booking.paidAmount) && booking.paidAmount >= 0
+        ? booking.paidAmount
+        : 0;
+
+    return this.resolveBookingPaymentStatus(totalAmount, paidAmount);
   }
 
   private resolveBookingPaymentStatus(

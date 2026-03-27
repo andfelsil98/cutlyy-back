@@ -33,6 +33,7 @@ export class BookingRoutes {
 
     router.get("/", bookingController.getAll);
     router.post("/", bookingController.create);
+    router.post("/:id/payments", bookingController.addPayment);
     router.put("/:id", bookingController.update);
     router.delete("/:id", bookingController.delete);
 

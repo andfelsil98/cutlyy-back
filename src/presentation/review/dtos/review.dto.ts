@@ -4,12 +4,13 @@ import type { ReviewTargetType } from "../../../domain/interfaces/review.interfa
 
 export interface CreateReviewDto {
   businessId: string;
-  branchId: string;
+  branchId?: string;
   targetType: ReviewTargetType;
   targetId: string;
   score: number;
   comment?: string;
   reviewerId: string;
+  reviewerName: string;
   bookingId: string;
   appointmentId?: string;
 }
@@ -43,11 +44,20 @@ export function validateCreateReviewDto(body: unknown): CreateReviewDto {
   const b = body as Record<string, unknown>;
 
   const businessId = validateRequiredText(b.businessId, "businessId");
-  const branchId = validateRequiredText(b.branchId, "branchId");
   const targetType = validateTargetType(b.targetType);
   const targetId = validateRequiredText(b.targetId, "targetId");
   const reviewerId = validateRequiredText(b.reviewerId, "reviewerId");
+  const reviewerName = normalizeSpaces(
+    validateRequiredText(b.reviewerName, "reviewerName")
+  );
   const bookingId = validateRequiredText(b.bookingId, "bookingId");
+
+  let branchId: string | undefined;
+  if (targetType === "BRANCH") {
+    branchId = validateRequiredText(b.branchId, "branchId");
+  } else if (typeof b.branchId === "string" && b.branchId.trim() !== "") {
+    branchId = b.branchId.trim();
+  }
 
   if (typeof b.score !== "number" || Number.isNaN(b.score)) {
     throw CustomError.badRequest("score es requerido y debe ser un número");
@@ -81,12 +91,13 @@ export function validateCreateReviewDto(body: unknown): CreateReviewDto {
 
   return {
     businessId,
-    branchId,
+    ...(branchId !== undefined && { branchId }),
     targetType,
     targetId,
     score,
     ...(comment !== undefined && { comment }),
     reviewerId,
+    reviewerName,
     bookingId,
     ...(appointmentId !== undefined && { appointmentId }),
   };

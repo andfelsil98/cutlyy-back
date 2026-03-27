@@ -26,20 +26,11 @@ const BUSINESS_MEMBERSHIPS_COLLECTION = "BusinessMemberships";
 export class ReviewService {
   async createReview(dto: CreateReviewDto): Promise<Review> {
     try {
-      const [business, branch, booking, reviewer] = await Promise.all([
+      const [business, booking, reviewer] = await Promise.all([
         this.getBusinessOrFail(dto.businessId),
-        this.getBranchOrFail(dto.branchId),
         this.getBookingOrFail(dto.bookingId),
         this.getReviewerOrFail(dto.reviewerId),
       ]);
-
-      this.ensureBusinessBranchBookingConsistency({
-        business,
-        branch,
-        booking,
-        businessId: dto.businessId,
-        branchId: dto.branchId,
-      });
 
       let appointment: Appointment | null = null;
       if (dto.appointmentId) {
@@ -47,6 +38,19 @@ export class ReviewService {
         appointment = await this.getAppointmentOrFail(dto.appointmentId);
         this.ensureAppointmentBelongsToBooking(appointment, booking);
       }
+
+      const effectiveBranchId = this.resolveEffectiveBranchId(dto, booking);
+      const branch = await this.getBranchOrFail(effectiveBranchId, {
+        allowDeleted: dto.targetType === "EMPLOYEE",
+      });
+
+      this.ensureBusinessBranchBookingConsistency({
+        business,
+        branch,
+        booking,
+        businessId: dto.businessId,
+        branchId: effectiveBranchId,
+      });
 
       this.ensureTargetConsistency({
         targetType: dto.targetType,
@@ -57,12 +61,13 @@ export class ReviewService {
 
       const payload = {
         businessId: dto.businessId,
-        branchId: dto.branchId,
+        branchId: effectiveBranchId,
         targetType: dto.targetType,
         targetId: dto.targetId,
         score: dto.score,
         ...(dto.comment !== undefined && { comment: dto.comment }),
         reviewerId: reviewer.document,
+        reviewerName: dto.reviewerName,
         bookingId: dto.bookingId,
         ...(dto.appointmentId !== undefined && { appointmentId: dto.appointmentId }),
         createdAt: FirestoreDataBase.generateTimeStamp(),
@@ -73,7 +78,7 @@ export class ReviewService {
         await this.incrementEmployeeMembershipScore(dto.businessId, dto.targetId, dto.score);
       }
       if (dto.targetType === "BRANCH") {
-        await this.incrementBranchScore(dto.businessId, dto.branchId, dto.score);
+        await this.incrementBranchScore(dto.businessId, effectiveBranchId, dto.score);
       }
       return created as Review;
     } catch (error) {
@@ -269,7 +274,23 @@ export class ReviewService {
     await Promise.all(allReviews.map((review) => this.deleteReviewWithData(review)));
   }
 
-  private async deleteReviewWithData(review: Review): Promise<void> {
+  async deleteReviewsByBranchId(
+    branchId: string,
+    opts?: { skipBranchScoreUpdate?: boolean }
+  ): Promise<void> {
+    const normalizedBranchId = branchId.trim();
+    if (normalizedBranchId === "") return;
+
+    const reviews = await FirestoreService.getAll<Review>(COLLECTION_NAME, [
+      { field: "branchId", operator: "==", value: normalizedBranchId },
+    ]);
+    await Promise.all(reviews.map((review) => this.deleteReviewWithData(review, opts)));
+  }
+
+  private async deleteReviewWithData(
+    review: Review,
+    opts?: { skipBranchScoreUpdate?: boolean }
+  ): Promise<void> {
     await FirestoreService.delete(COLLECTION_NAME, review.id);
 
     if (review.targetType === "EMPLOYEE") {
@@ -279,7 +300,10 @@ export class ReviewService {
         review.score
       );
     }
-    if (review.targetType === "BRANCH") {
+    if (
+      review.targetType === "BRANCH" &&
+      opts?.skipBranchScoreUpdate !== true
+    ) {
       await this.decrementBranchScore(review.businessId, review.branchId, review.score);
     }
   }
@@ -298,7 +322,10 @@ export class ReviewService {
     return business;
   }
 
-  private async getBranchOrFail(id: string): Promise<Branch> {
+  private async getBranchOrFail(
+    id: string,
+    opts?: { allowDeleted?: boolean }
+  ): Promise<Branch> {
     const branches = await FirestoreService.getAll<Branch>(BRANCHES_COLLECTION, [
       { field: "id", operator: "==", value: id },
     ]);
@@ -306,7 +333,7 @@ export class ReviewService {
       throw CustomError.notFound("No existe una sede con este id");
     }
     const branch = branches[0]!;
-    if (branch.status === "DELETED") {
+    if (branch.status === "DELETED" && opts?.allowDeleted !== true) {
       throw CustomError.badRequest("No se puede crear una reseña para una sede eliminada");
     }
     return branch;
@@ -392,6 +419,26 @@ export class ReviewService {
         "appointmentId no pertenece al booking enviado"
       );
     }
+  }
+
+  private resolveEffectiveBranchId(dto: CreateReviewDto, booking: Booking): string {
+    if (dto.targetType === "BRANCH") {
+      const branchId = dto.branchId?.trim() ?? "";
+      if (branchId === "") {
+        throw CustomError.badRequest(
+          "branchId es requerido cuando targetType es BRANCH"
+        );
+      }
+      return branchId;
+    }
+
+    const branchIdFromBooking = booking.branchId?.trim() ?? "";
+    if (branchIdFromBooking === "") {
+      throw CustomError.badRequest(
+        "El booking no tiene branchId válido para crear la reseña del empleado"
+      );
+    }
+    return branchIdFromBooking;
   }
 
   private ensureTargetConsistency({

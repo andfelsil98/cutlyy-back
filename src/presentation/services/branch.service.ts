@@ -1,33 +1,53 @@
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
 import { CustomError } from "../../domain/errors/custom-error";
 import type { Business } from "../../domain/interfaces/business.interface";
+import type { BusinessMembership } from "../../domain/interfaces/business-membership.interface";
 import type { Branch } from "../../domain/interfaces/branch.interface";
+import { slugFromName } from "../../domain/utils/string.utils";
 import type { PaginatedResult, PaginationParams } from "../../domain/interfaces/pagination.interface";
 import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
 import type { CreateBranchesBodyDto } from "../branch/dtos/create-branch.dto";
 import type { UpdateBranchBodyDto } from "../branch/dtos/update-branch.dto";
 import FirestoreService from "./firestore.service";
+import { MetricService } from "./metric.service";
+import { ReviewService } from "./review.service";
+import { SchedulingIntegrityService } from "./scheduling-integrity.service";
 
 const COLLECTION_NAME = "Branches";
 const BUSINESS_COLLECTION = "Businesses";
+const BUSINESS_MEMBERSHIPS_COLLECTION = "BusinessMemberships";
 
 function toNameKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
 export class BranchService {
+  constructor(
+    private readonly reviewService: ReviewService = new ReviewService(),
+    private readonly metricService: MetricService = new MetricService(),
+    private readonly schedulingIntegrityService: SchedulingIntegrityService =
+      new SchedulingIntegrityService()
+  ) {}
+
   async getAllBranches(
-    params: PaginationParams & { businessId?: string }
+    params: PaginationParams & { id?: string; businessId?: string; includeDeletes?: boolean }
   ): Promise<PaginatedResult<Branch>> {
     try {
       const page = Math.max(1, params.page);
       const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, params.pageSize));
       const filters = [
-        {
-          field: "status" as const,
-          operator: "in" as const,
-          value: ["ACTIVE", "INACTIVE"],
-        },
+        ...(params.id != null && params.id.trim() !== ""
+          ? [{ field: "id" as const, operator: "==" as const, value: params.id.trim() }]
+          : []),
+        ...(params.includeDeletes === true
+          ? []
+          : [
+              {
+                field: "status" as const,
+                operator: "in" as const,
+                value: ["ACTIVE", "INACTIVE"],
+              },
+            ]),
         ...(params.businessId != null && params.businessId.trim() !== ""
           ? [{ field: "businessId" as const, operator: "==" as const, value: params.businessId.trim() }]
           : []),
@@ -49,7 +69,11 @@ export class BranchService {
       const existingBranches = await FirestoreService.getAll<Branch>(COLLECTION_NAME, [
         { field: "businessId", operator: "==", value: dto.businessId },
       ]);
-      const existingNameKeys = new Set(existingBranches.map((b) => toNameKey(b.name)));
+      const existingNameKeys = new Set(
+        existingBranches
+          .filter((branch) => branch.status !== "DELETED")
+          .map((branch) => toNameKey(branch.name))
+      );
 
       const namesInRequest = new Set<string>();
       for (const item of dto.branches) {
@@ -96,14 +120,23 @@ export class BranchService {
       const branch = branches[0]!;
 
       if (dto.name !== undefined) {
-        const existingBranches = await FirestoreService.getAll<Branch>(COLLECTION_NAME, [
-          { field: "businessId", operator: "==", value: branch.businessId },
-        ]);
         const nameKey = toNameKey(dto.name);
-        const nameTaken = existingBranches.some(
-          (b) => b.id !== id && toNameKey(b.name) === nameKey
-        );
-        if (nameTaken) throw CustomError.conflict("Ya existe una sede con este nombre en este negocio");
+        const currentNameKey = toNameKey(branch.name);
+
+        if (nameKey !== currentNameKey) {
+          const existingBranches = await FirestoreService.getAll<Branch>(COLLECTION_NAME, [
+            { field: "businessId", operator: "==", value: branch.businessId },
+          ]);
+          const nameTaken = existingBranches.some(
+            (b) =>
+              b.status !== "DELETED" &&
+              b.id !== id &&
+              toNameKey(b.name) === nameKey
+          );
+          if (nameTaken) {
+            throw CustomError.conflict("Ya existe una sede con este nombre en este negocio");
+          }
+        }
       }
 
       const payload: Record<string, unknown> = {
@@ -132,15 +165,47 @@ export class BranchService {
         { field: "id", operator: "==", value: id },
       ]);
       if (branches.length === 0) throw CustomError.notFound("No existe una sede con este id");
+      const branch = branches[0]!;
+      await this.schedulingIntegrityService.ensureBranchCanBeDeleted(branch.id);
       const payload = {
         status: "DELETED" as const,
         deletedAt: FirestoreDataBase.generateTimeStamp(),
       };
       await FirestoreService.update(COLLECTION_NAME, id, payload);
+      await Promise.all([
+        this.deleteBranchStorageFolder(branch),
+        this.clearMembershipBranchAssignments(branch.id),
+        this.metricService.deleteBranchMetrics(branch.id),
+        this.reviewService.deleteReviewsByBranchId(branch.id, {
+          skipBranchScoreUpdate: true,
+        }),
+      ]);
       return await FirestoreService.getById<Branch>(COLLECTION_NAME, id);
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
     }
+  }
+
+  private async deleteBranchStorageFolder(branch: Branch): Promise<void> {
+    const storagePrefix = `bussinesses/${branch.businessId}/branches/${slugFromName(branch.name)}/`;
+    const bucket = FirestoreDataBase.getAdmin().storage().bucket();
+    await bucket.deleteFiles({ prefix: storagePrefix });
+  }
+
+  private async clearMembershipBranchAssignments(branchId: string): Promise<void> {
+    const memberships = await FirestoreService.getAll<BusinessMembership>(
+      BUSINESS_MEMBERSHIPS_COLLECTION,
+      [{ field: "branchId", operator: "==", value: branchId }]
+    );
+
+    await Promise.all(
+      memberships.map((membership) =>
+        FirestoreService.update(BUSINESS_MEMBERSHIPS_COLLECTION, membership.id, {
+          branchId: null,
+          updatedAt: FirestoreDataBase.generateTimeStamp(),
+        })
+      )
+    );
   }
 }

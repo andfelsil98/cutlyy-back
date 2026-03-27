@@ -9,6 +9,7 @@ export interface Review {
   score: number;
   comment?: string;
   reviewerId: string;
+  reviewerName: string;
   bookingId: string;
   appointmentId?: string;
   createdAt: string;

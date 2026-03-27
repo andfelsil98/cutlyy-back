@@ -14,6 +14,7 @@ import {
 } from "../../domain/interfaces/pagination.interface";
 import FirestoreService from "./firestore.service";
 import { RoleService } from "./role.service";
+import { SchedulingIntegrityService } from "./scheduling-integrity.service";
 import { UserService } from "./user.service";
 
 const COLLECTION_NAME = "BusinessMemberships";
@@ -39,7 +40,9 @@ export type BusinessMembershipWithRelations = Omit<
 export class BusinessMembershipService {
   constructor(
     private readonly userService?: UserService,
-    private readonly roleService?: RoleService
+    private readonly roleService?: RoleService,
+    private readonly schedulingIntegrityService: SchedulingIntegrityService =
+      new SchedulingIntegrityService()
   ) {}
 
   async getAllMemberships(
@@ -359,6 +362,13 @@ export class BusinessMembershipService {
             "No se puede activar una membresía sin un rol asociado"
           );
         }
+      } else if (membership.isEmployee === true) {
+        const employeeIdentifiers = await this.resolveMembershipUserIdentifiers(
+          membership.userId
+        );
+        await this.schedulingIntegrityService.ensureEmployeeCanBeDeleted(
+          employeeIdentifiers
+        );
       }
 
       const payload = {
@@ -384,11 +394,20 @@ export class BusinessMembershipService {
       }
 
       const nextIsEmployee = !membership.isEmployee;
-      const userDocument = await this.resolveMembershipUserDocument(membership.userId);
+      const employeeIdentifiers = await this.resolveMembershipUserIdentifiers(
+        membership.userId
+      );
+      const userDocument = employeeIdentifiers[0]!;
 
       if (nextIsEmployee && membership.status !== "ACTIVE") {
         throw CustomError.badRequest(
           "Solo se puede marcar como empleado una membresía ACTIVE"
+        );
+      }
+
+      if (!nextIsEmployee) {
+        await this.schedulingIntegrityService.ensureEmployeeCanBeDeleted(
+          employeeIdentifiers
         );
       }
 
@@ -605,7 +624,7 @@ export class BusinessMembershipService {
     };
   }
 
-  private async resolveMembershipUserDocument(membershipUserId: string): Promise<string> {
+  private async resolveMembershipUser(membershipUserId: string): Promise<User> {
     const normalizedMembershipUserId = membershipUserId.trim();
     if (normalizedMembershipUserId === "") {
       throw CustomError.badRequest("La membresía no tiene un userId válido");
@@ -638,7 +657,16 @@ export class BusinessMembershipService {
       );
     }
 
-    return user.document.trim();
+    return user;
+  }
+
+  private async resolveMembershipUserIdentifiers(
+    membershipUserId: string
+  ): Promise<string[]> {
+    const user = await this.resolveMembershipUser(membershipUserId);
+    return Array.from(new Set([user.document.trim(), user.id.trim()])).filter(
+      (identifier) => identifier !== ""
+    );
   }
 
   private buildNextEmployeesList(

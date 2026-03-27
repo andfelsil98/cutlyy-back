@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { envs } from "../../config/envs";
 import { createGoogleCloudTasksQueueProvider } from "../../infrastructure/tasks/google-cloud-tasks.factory";
+import { createWhatsAppService } from "../../infrastructure/whatsapp/whatsapp.service.factory";
 import { AppointmentController } from "./appointment.controller";
 import { AppointmentService } from "../services/appointment.service";
 import { AppointmentStatusTaskSchedulerService } from "../services/appointment-status-task-scheduler.service";
@@ -15,10 +16,14 @@ export class AppointmentRoutes {
         targetBaseUrl: envs.CLOUD_TASKS_TARGET_BASE_URL,
         internalToken: envs.CLOUD_TASKS_INTERNAL_TOKEN,
       });
+    const whatsAppService = createWhatsAppService();
 
     const appointmentService = new AppointmentService(
       undefined,
-      appointmentStatusTaskScheduler
+      appointmentStatusTaskScheduler,
+      undefined,
+      undefined,
+      whatsAppService
     );
     const appointmentController = new AppointmentController(appointmentService);
 

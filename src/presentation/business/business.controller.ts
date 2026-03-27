@@ -102,8 +102,20 @@ export class BusinessController {
       res.status(400).json({ message: "El id del negocio es requerido" });
       return;
     }
+
+    const documentClaimRaw = req.decodedIdToken?.["document"];
+    if (typeof documentClaimRaw !== "string" || documentClaimRaw.trim() === "") {
+      next(
+        CustomError.unauthorized(
+          "Token de sesión inválido: claim document no presente en el token."
+        )
+      );
+      return;
+    }
+    const actorDocument = documentClaimRaw.trim();
+
     this.businessService
-      .deleteBusiness(id)
+      .deleteBusiness(id, { actorDocument })
       .then((business) => {
         res.status(200).json(business);
       })

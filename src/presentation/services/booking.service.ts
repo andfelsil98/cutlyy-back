@@ -205,6 +205,11 @@ export class BookingService {
         updatedAt: FirestoreDataBase.generateTimeStamp(),
       });
 
+      await this.appointmentService.syncBookingRevenueMetricsFromSnapshot(
+        createdBooking.id,
+        null
+      );
+
       await this.scheduleStatusTasksForCreatedBookingAppointments(createdAppointments);
 
       await this.sendBookingCreatedWhatsApp(
@@ -235,9 +240,60 @@ export class BookingService {
     }
   }
 
+  async addPayment(id: string, amount: number): Promise<Booking> {
+    try {
+      const booking = await this.getBookingById(id);
+      const beforeRevenueSnapshot =
+        await this.appointmentService.captureBookingRevenueSnapshot(id);
+
+      if (booking.status === "DELETED" || booking.status === "CANCELLED") {
+        throw CustomError.badRequest(
+          "No se pueden registrar abonos en un agendamiento CANCELLED o DELETED"
+        );
+      }
+
+      const remainingAmount = Math.max(0, booking.totalAmount - booking.paidAmount);
+      if (remainingAmount <= 0) {
+        throw CustomError.badRequest(
+          "El agendamiento ya no tiene saldo pendiente por pagar"
+        );
+      }
+
+      if (amount > remainingAmount) {
+        throw CustomError.badRequest(
+          "El abono no puede ser mayor al monto faltante del agendamiento"
+        );
+      }
+
+      const nextPaidAmount = booking.paidAmount + amount;
+      const nextPaymentStatus = this.resolvePaymentStatus(
+        booking.totalAmount,
+        nextPaidAmount
+      );
+
+      await FirestoreService.update(BOOKINGS_COLLECTION, id, {
+        paidAmount: nextPaidAmount,
+        paymentStatus: nextPaymentStatus,
+        updatedAt: FirestoreDataBase.generateTimeStamp(),
+      });
+
+      await this.appointmentService.syncBookingRevenueMetricsFromSnapshot(
+        id,
+        beforeRevenueSnapshot
+      );
+
+      return await this.getBookingById(id);
+    } catch (error) {
+      if (error instanceof CustomError) throw error;
+      throw CustomError.internalServerError("Error interno del servidor");
+    }
+  }
+
   async updateBooking(id: string, dto: UpdateBookingDto): Promise<Booking> {
     try {
       const existingBooking = await this.getBookingById(id);
+      const beforeRevenueSnapshot =
+        await this.appointmentService.captureBookingRevenueSnapshot(id);
       const hasBookingEditChanges =
         dto.branchId !== undefined ||
         dto.clientId !== undefined ||
@@ -326,7 +382,9 @@ export class BookingService {
 
           if (operation.op === "cancel") {
             if (appointment.status !== "DELETED") {
-              await this.appointmentService.cancelAppointment(operation.appointmentId);
+              await this.appointmentService.cancelAppointment(operation.appointmentId, {
+                skipBookingSync: true,
+              });
             }
             continue;
           }
@@ -351,7 +409,10 @@ export class BookingService {
               serviceId: operation.serviceId,
               employeeId: operation.employeeId,
             },
-            { branchIdOverride: nextBranchId }
+            {
+              branchIdOverride: nextBranchId,
+              skipBookingSync: true,
+            }
           );
         }
       }
@@ -370,7 +431,8 @@ export class BookingService {
         totalAmount = await this.calculateTotalPriceFromAppointments(
           existingBooking.businessId,
           normalizedAppointmentIds,
-          cachedServices
+          cachedServices,
+          { includeDeletedServices: dto.status === "FINISHED" }
         );
         if (paidAmount > totalAmount) {
           throw CustomError.badRequest(
@@ -378,6 +440,14 @@ export class BookingService {
           );
         }
         paymentStatus = this.resolvePaymentStatus(totalAmount, paidAmount);
+      }
+
+      if (hasBookingEditChanges || dto.status === "CREATED") {
+        await this.ensureBookingCanBeMarkedCreated(
+          existingBooking.businessId,
+          nextBranchId,
+          normalizedAppointmentIds
+        );
       }
 
       const payload: Record<string, unknown> = {
@@ -434,6 +504,11 @@ export class BookingService {
       }
 
       await FirestoreService.update(BOOKINGS_COLLECTION, id, payload);
+
+      await this.appointmentService.syncBookingRevenueMetricsFromSnapshot(
+        id,
+        beforeRevenueSnapshot
+      );
 
       if (
         !hasBookingEditChanges &&
@@ -704,7 +779,8 @@ export class BookingService {
   private async calculateTotalPriceFromAppointments(
     businessId: string,
     appointmentIds: string[],
-    cachedServices?: Service[]
+    cachedServices?: Service[],
+    opts?: { includeDeletedServices?: boolean }
   ): Promise<number> {
     if (appointmentIds.length === 0) return 0;
 
@@ -717,7 +793,12 @@ export class BookingService {
       .map((appointment) => appointment.serviceId.trim())
       .filter((serviceId) => serviceId !== "");
 
-    return this.calculateTotalPriceFromServiceIds(businessId, activeServiceIds, cachedServices);
+    return this.calculateTotalPriceFromServiceIds(
+      businessId,
+      activeServiceIds,
+      cachedServices,
+      opts
+    );
   }
 
   private ensureBookingAppointmentsNotInPast(
@@ -792,7 +873,8 @@ export class BookingService {
   private async calculateTotalPriceFromServiceIds(
     businessId: string,
     serviceIds: string[],
-    cachedServices?: Service[]
+    cachedServices?: Service[],
+    opts?: { includeDeletedServices?: boolean }
   ): Promise<number> {
     const requestedServiceIds = serviceIds.map((serviceId) => serviceId.trim());
     const requestedUniqueServiceIds = Array.from(
@@ -805,7 +887,10 @@ export class BookingService {
       ]);
     const servicesById = new Map(
       services
-        .filter((service) => service.status !== "DELETED")
+        .filter(
+          (service) =>
+            opts?.includeDeletedServices === true || service.status !== "DELETED"
+        )
         .map((service) => [service.id.trim(), service] as const)
     );
 
@@ -854,7 +939,10 @@ export class BookingService {
 
     for (const appointmentId of appointmentIds) {
       const appointment = appointmentsById.get(appointmentId);
-      if (!appointment || appointment.status === "DELETED") {
+      if (!appointment) {
+        continue;
+      }
+      if (appointment.status === "DELETED" && status !== "DELETED") {
         continue;
       }
       if (
@@ -877,24 +965,45 @@ export class BookingService {
       }
 
       if (status === "CANCELLED") {
-        await this.appointmentService.cancelAppointment(appointmentId);
+        await this.appointmentService.cancelAppointment(appointmentId, {
+          skipBookingSync: true,
+        });
         continue;
       }
 
       if (status === "DELETED") {
-        await this.appointmentService.deleteAppointment(appointmentId);
+        await this.appointmentService.deleteAppointment(appointmentId, {
+          skipBookingSync: true,
+        });
         continue;
       }
 
-      const timestamp = FirestoreDataBase.generateTimeStamp();
-      const payload: Record<string, unknown> = {
-        status,
-        updatedAt: timestamp,
-      };
-      payload.cancelledAt = FieldValue.delete();
-      payload.deletedAt = FieldValue.delete();
+      await this.appointmentService.setAppointmentStatus(appointmentId, status, {
+        skipBookingSync: true,
+      });
+    }
+  }
 
-      await FirestoreService.update(APPOINTMENTS_COLLECTION, appointmentId, payload);
+  private async ensureBookingCanBeMarkedCreated(
+    businessId: string,
+    branchId: string,
+    appointmentIds: string[]
+  ): Promise<void> {
+    await this.appointmentService.ensureBusinessAndBranch(businessId, branchId);
+    if (appointmentIds.length === 0) return;
+
+    const appointments = await this.appointmentService.getAppointmentsByIds(appointmentIds);
+    for (const appointment of appointments) {
+      if (appointment.status === "DELETED") continue;
+
+      await this.appointmentService.ensureServiceExistsInBusiness(
+        appointment.serviceId,
+        businessId
+      );
+      await this.appointmentService.ensureEmployeeIsActiveInBusiness(
+        appointment.employeeId,
+        businessId
+      );
     }
   }
 

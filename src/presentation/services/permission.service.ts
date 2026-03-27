@@ -1,12 +1,16 @@
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
 import { CustomError } from "../../domain/errors/custom-error";
+import type { DbFilters } from "../../domain/interfaces/dbFilters.interface";
 import type { Permission } from "../../domain/interfaces/permission.interface";
 import type { Module } from "../../domain/interfaces/module.interface";
 import type {
   PaginatedResult,
   PaginationParams,
 } from "../../domain/interfaces/pagination.interface";
-import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
+import {
+  MAX_PAGE_SIZE,
+  buildPagination,
+} from "../../domain/interfaces/pagination.interface";
 import FirestoreService from "./firestore.service";
 import type { CreatePermissionDto } from "../permission/dtos/create-permission.dto";
 
@@ -18,17 +22,92 @@ function toNameKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function buildModuleFilters(moduleId?: string): DbFilters[] {
+  if (moduleId == null || moduleId === "") return [];
+
+  return [{ field: "moduleId", operator: "==" as const, value: moduleId }];
+}
+
 export class PermissionService {
   async getAllPermissions(
-    params: PaginationParams
+    params: PaginationParams & {
+      moduleId?: string;
+      id?: string;
+      ids?: string[];
+    }
   ): Promise<PaginatedResult<Permission>> {
     try {
       const page = Math.max(1, params.page);
       const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, params.pageSize));
-      return await FirestoreService.getAllPaginated<Permission>(
-        COLLECTION_NAME,
-        { page, pageSize }
+
+      const normalizedId = params.id?.trim();
+      const normalizedModuleId = params.moduleId?.trim();
+      const normalizedIds = Array.from(
+        new Set(
+          (params.ids ?? [])
+            .map((permissionId) => permissionId.trim())
+            .filter((permissionId) => permissionId !== "")
+        )
       );
+
+      if (
+        normalizedId == null &&
+        normalizedModuleId == null &&
+        normalizedIds.length === 0
+      ) {
+        return await FirestoreService.getAllPaginated<Permission>(
+          COLLECTION_NAME,
+          { page, pageSize }
+        );
+      }
+
+      let permissions: Permission[] = [];
+      if (normalizedId != null && normalizedId !== "") {
+        const filters: DbFilters[] = [
+          { field: "id", operator: "==" as const, value: normalizedId },
+          ...buildModuleFilters(normalizedModuleId),
+        ];
+        permissions = await FirestoreService.getAll<Permission>(COLLECTION_NAME, filters);
+      } else if (normalizedIds.length > 0) {
+        const CHUNK_SIZE = 30;
+        const chunks: string[][] = [];
+        for (let index = 0; index < normalizedIds.length; index += CHUNK_SIZE) {
+          chunks.push(normalizedIds.slice(index, index + CHUNK_SIZE));
+        }
+
+        const results = await Promise.all(
+          chunks.map((chunk) => {
+            const filters: DbFilters[] = [
+              { field: "id", operator: "in" as const, value: chunk },
+              ...buildModuleFilters(normalizedModuleId),
+            ];
+            return FirestoreService.getAll<Permission>(COLLECTION_NAME, filters);
+          })
+        );
+
+        const uniquePermissions = new Map<string, Permission>();
+        results.flat().forEach((permission) => {
+          uniquePermissions.set(permission.id, permission);
+        });
+        permissions = Array.from(uniquePermissions.values());
+      } else {
+        const filters = buildModuleFilters(normalizedModuleId);
+        permissions = await FirestoreService.getAll<Permission>(COLLECTION_NAME, filters);
+      }
+
+      permissions.sort((a, b) =>
+        (b.createdAt ?? "").localeCompare(a.createdAt ?? "")
+      );
+
+      const total = permissions.length;
+      const offset = (page - 1) * pageSize;
+      const data = permissions.slice(offset, offset + pageSize);
+
+      return {
+        data,
+        total,
+        pagination: buildPagination(page, pageSize, total),
+      };
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");

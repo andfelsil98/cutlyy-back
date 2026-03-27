@@ -11,6 +11,7 @@ import type { User } from "../../domain/interfaces/user.interface";
 import { ensureColombiaCountryCode } from "../../domain/utils/string.utils";
 import { logger } from "../../infrastructure/logger/logger";
 import FirestoreService from "./firestore.service";
+import { SchedulingIntegrityService } from "./scheduling-integrity.service";
 
 const COLLECTION_NAME = "Users";
 const DELETED_USERS_COLLECTION = "DeletedUsers";
@@ -33,6 +34,11 @@ export interface UpdateUserData {
 }
 
 export class UserService {
+  constructor(
+    private readonly schedulingIntegrityService: SchedulingIntegrityService =
+      new SchedulingIntegrityService()
+  ) {}
+
   async existsByEmail(email: string): Promise<boolean> {
     const users = await FirestoreService.getAll<User>(COLLECTION_NAME, [
       { field: "email", operator: "==", value: email },
@@ -191,6 +197,11 @@ export class UserService {
       if (!user) {
         throw CustomError.notFound("No existe un usuario con este número de documento");
       }
+
+      await this.schedulingIntegrityService.ensureEmployeeCanBeDeleted([
+        user.document,
+        user.id,
+      ]);
 
       await this.deleteFirebaseAuthUserByEmail(user.email);
 

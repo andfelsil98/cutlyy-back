@@ -22,7 +22,7 @@ export class Server {
   async start() {
     this.app.use(cors({ origin: "*" }));
     this.app.use(helmet());
-    this.app.use(express.json());
+    this.app.use(express.json({ strict: false }));
     this.app.use(express.urlencoded({ extended: true }));
     this.app.use(requestLogger);
     this.app.use(rateLimitMiddleware);

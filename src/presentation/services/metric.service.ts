@@ -103,6 +103,20 @@ export interface MetricInsightsResponse {
 }
 
 export class MetricService {
+  async deleteBranchMetrics(branchId: string): Promise<void> {
+    const normalizedBranchId = branchId.trim();
+    if (normalizedBranchId === "") return;
+
+    const metrics = await FirestoreService.getAll<Metric>(COLLECTION_NAME, [
+      { field: "type", operator: "==", value: "BRANCH" },
+      { field: "branchId", operator: "==", value: normalizedBranchId },
+    ]);
+
+    await Promise.all(
+      metrics.map((metric) => FirestoreService.delete(COLLECTION_NAME, metric.id))
+    );
+  }
+
   async getMetricInsights(input: GetMetricInsightsInput): Promise<MetricInsightsResponse> {
     const entityId = this.resolveOptionalEntityId(input);
 

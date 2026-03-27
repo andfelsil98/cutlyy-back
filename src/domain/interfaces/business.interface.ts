@@ -13,6 +13,7 @@ export interface Business {
   createdAt: string;
   updatedAt?: string;
   deletedAt?: string;
+  deletedBy?: string;
 }
 
 /** Resultado de crear un negocio completo (negocio + servicios + sedes). */

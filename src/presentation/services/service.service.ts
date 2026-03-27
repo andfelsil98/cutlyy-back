@@ -7,6 +7,7 @@ import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
 import type { CreateServicesBodyDto } from "../service/dtos/create-service.dto";
 import type { UpdateServiceBodyDto } from "../service/dtos/update-service.dto";
 import FirestoreService from "./firestore.service";
+import { SchedulingIntegrityService } from "./scheduling-integrity.service";
 
 const COLLECTION_NAME = "Services";
 const BUSINESS_COLLECTION = "Businesses";
@@ -16,6 +17,11 @@ function toNameKey(value: string): string {
 }
 
 export class ServiceService {
+  constructor(
+    private readonly schedulingIntegrityService: SchedulingIntegrityService =
+      new SchedulingIntegrityService()
+  ) {}
+
   async getAllServices(
     params: PaginationParams & { businessId?: string; id?: string; includeDeletes?: boolean }
   ): Promise<PaginatedResult<Service>> {
@@ -136,6 +142,7 @@ export class ServiceService {
         { field: "id", operator: "==", value: id },
       ]);
       if (services.length === 0) throw CustomError.notFound("No existe un servicio con este id");
+      await this.schedulingIntegrityService.ensureServiceCanBeDeleted(services[0]!.id);
       const payload = {
         status: "DELETED" as const,
         deletedAt: FirestoreDataBase.generateTimeStamp(),

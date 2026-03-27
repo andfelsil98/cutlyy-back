@@ -7,14 +7,17 @@ import type {
 import type { BusinessMembership } from "../../domain/interfaces/business-membership.interface";
 import type { Branch } from "../../domain/interfaces/branch.interface";
 import type { Service } from "../../domain/interfaces/service.interface";
+import type { User } from "../../domain/interfaces/user.interface";
 import type { PaginatedResult, PaginationParams } from "../../domain/interfaces/pagination.interface";
 import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
 import { normalizeConsecutivePrefix } from "../../domain/utils/booking-consecutive.utils";
+import { logger } from "../../infrastructure/logger/logger";
 import type { CreateBusinessDto } from "../business/dtos/create-business.dto";
 import type { CreateBusinessCompleteDto } from "../business/dtos/create-business-complete.dto";
 import type { UpdateBusinessDto } from "../business/dtos/update-business.dto";
 import type { CreateBranchItemDto } from "../branch/dtos/create-branch.dto";
 import type { CreateServiceItemDto } from "../service/dtos/create-service.dto";
+import type { AppointmentStatusTaskScheduler } from "./appointment-status-task-scheduler.service";
 import type { BranchService } from "./branch.service";
 import FirestoreService from "./firestore.service";
 import type { ServiceService } from "./service.service";
@@ -26,7 +29,12 @@ const BRANCHES_COLLECTION = "Branches";
 const BUSINESS_MEMBERSHIPS_COLLECTION = "BusinessMemberships";
 const APPOINTMENTS_COLLECTION = "Appointments";
 const BOOKINGS_COLLECTION = "Bookings";
+const METRICS_COLLECTION = "Metrics";
+const REVIEWS_COLLECTION = "Reviews";
+const ROLES_COLLECTION = "Roles";
 const USERS_COLLECTION = "Users";
+const USER_BUSINESS_MEMBERSHIPS_SUBCOLLECTION = "businessMemberships";
+const ROLE_PERMISSIONS_SUBCOLLECTION = "Permissions";
 const ROOT_OWNER_ROLE_ID = "kr3ECTOcAGHnsbvDAr4y";
 const ROOT_SUPER_ADMIN_ID = "WyeIL50oCUFg9PBvB9m9";
 
@@ -34,15 +42,47 @@ function toNameKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function normalizeUniqueStrings(values: Array<string | null | undefined>): string[] {
+  return Array.from(
+    new Set(
+      values
+        .map((value) => value?.trim() ?? "")
+        .filter((value) => value !== "")
+    )
+  );
+}
+
 interface FirestoreEntityWithId {
   id: string;
+}
+
+interface AppointmentDeletionRecord extends FirestoreEntityWithId {
+  employeeId?: string;
+}
+
+interface FirestoreMembershipLinkDoc {
+  businessId?: string;
+  membershipId?: string;
+}
+
+interface BusinessDeletionContext {
+  appointmentIds: string[];
+  bookingIds: string[];
+  branchIds: string[];
+  membershipIds: string[];
+  metricIds: string[];
+  reviewIds: string[];
+  roleIds: string[];
+  serviceIds: string[];
+  users: User[];
 }
 
 export class BusinessService {
   constructor(
     private readonly serviceService?: ServiceService,
     private readonly branchService?: BranchService,
-    private readonly userService?: UserService
+    private readonly userService?: UserService,
+    private readonly appointmentStatusTaskScheduler?: AppointmentStatusTaskScheduler
   ) {}
 
   async getAllBusinesses(
@@ -238,18 +278,51 @@ export class BusinessService {
     }
   }
 
-  async deleteBusiness(id: string): Promise<Business> {
+  async deleteBusiness(
+    id: string,
+    opts: { actorDocument: string }
+  ): Promise<Business> {
     try {
-      await FirestoreService.getById<Business>(COLLECTION_NAME, id);
+      const business = await FirestoreService.getById<Business>(COLLECTION_NAME, id);
+      const actorDocument = opts.actorDocument.trim();
+      if (actorDocument === "") {
+        throw CustomError.badRequest(
+          "No se pudo resolver el documento del actor que elimina el negocio"
+        );
+      }
 
-      const deletedAt = FirestoreDataBase.generateTimeStamp();
-      const payload = {
-        status: "DELETED" as const,
-        deletedAt,
-      };
-      await FirestoreService.update(COLLECTION_NAME, id, payload);
-      await this.markMembershipsAsDeletedByBusiness(id, deletedAt);
-      await this.hardDeleteBusinessRelations(id);
+      const payload: Record<string, unknown> = {};
+      if (business.status !== "DELETED") {
+        payload.status = "DELETED" as const;
+      }
+      if (business.deletedAt == null) {
+        payload.deletedAt = FirestoreDataBase.generateTimeStamp();
+      }
+      if (business.deletedBy == null || business.deletedBy.trim() === "") {
+        payload.deletedBy = actorDocument;
+      }
+      if (Object.keys(payload).length > 0) {
+        await FirestoreService.update(COLLECTION_NAME, id, payload);
+      }
+
+      const deletionContext = await this.loadBusinessDeletionContext(id);
+      await this.deleteAppointmentStatusTasks(deletionContext.appointmentIds);
+      await this.deleteDocuments(REVIEWS_COLLECTION, deletionContext.reviewIds);
+      await this.deleteDocuments(METRICS_COLLECTION, deletionContext.metricIds);
+      await this.deleteUserBusinessMembershipLinks(
+        deletionContext.users,
+        id,
+        new Set(deletionContext.membershipIds)
+      );
+      await this.deleteDocuments(
+        BUSINESS_MEMBERSHIPS_COLLECTION,
+        deletionContext.membershipIds
+      );
+      await this.deleteRoleDocuments(deletionContext.roleIds);
+      await this.deleteDocuments(APPOINTMENTS_COLLECTION, deletionContext.appointmentIds);
+      await this.deleteDocuments(BOOKINGS_COLLECTION, deletionContext.bookingIds);
+      await this.deleteDocuments(SERVICES_COLLECTION, deletionContext.serviceIds);
+      await this.deleteDocuments(BRANCHES_COLLECTION, deletionContext.branchIds);
       await this.deleteBusinessStorageFolder(id);
       return this.normalizeBusiness(
         await FirestoreService.getById<Business>(COLLECTION_NAME, id)
@@ -369,28 +442,6 @@ export class BusinessService {
     );
   }
 
-  private async markMembershipsAsDeletedByBusiness(
-    businessId: string,
-    deletedAt: ReturnType<typeof FirestoreDataBase.generateTimeStamp>
-  ): Promise<void> {
-    const memberships = await FirestoreService.getAll<BusinessMembership>(
-      BUSINESS_MEMBERSHIPS_COLLECTION,
-      [{ field: "businessId", operator: "==", value: businessId }]
-    );
-
-    const updates = memberships.map((membership) => {
-      if (membership.status === "DELETED") {
-        return Promise.resolve();
-      }
-      return FirestoreService.update(BUSINESS_MEMBERSHIPS_COLLECTION, membership.id, {
-        status: "DELETED" as const,
-        deletedAt,
-      });
-    });
-
-    await Promise.all(updates);
-  }
-
   private async markMembershipsAsInactiveByBusiness(
     businessId: string
   ): Promise<void> {
@@ -412,57 +463,289 @@ export class BusinessService {
     await Promise.all(updates);
   }
 
-  private async hardDeleteBusinessRelations(businessId: string): Promise<void> {
-    const [branches, services, bookings, appointmentsByBusiness] = await Promise.all([
-      FirestoreService.getAll<FirestoreEntityWithId>(BRANCHES_COLLECTION, [
+  private async deleteBusinessStorageFolder(businessId: string): Promise<void> {
+    const storagePrefix = `bussinesses/${businessId}/`;
+    const bucket = FirestoreDataBase.getAdmin().storage().bucket();
+    await bucket.deleteFiles({ prefix: storagePrefix });
+  }
+
+  private async loadBusinessDeletionContext(
+    businessId: string
+  ): Promise<BusinessDeletionContext> {
+    const [
+      memberships,
+      roles,
+      services,
+      branches,
+      bookings,
+      appointmentsByBusiness,
+      reviews,
+      businessMetrics,
+    ] = await Promise.all([
+      FirestoreService.getAll<BusinessMembership>(BUSINESS_MEMBERSHIPS_COLLECTION, [
+        { field: "businessId", operator: "==", value: businessId },
+      ]),
+      FirestoreService.getAll<FirestoreEntityWithId>(ROLES_COLLECTION, [
+        { field: "type", operator: "==", value: "CUSTOM" },
         { field: "businessId", operator: "==", value: businessId },
       ]),
       FirestoreService.getAll<FirestoreEntityWithId>(SERVICES_COLLECTION, [
         { field: "businessId", operator: "==", value: businessId },
       ]),
+      FirestoreService.getAll<FirestoreEntityWithId>(BRANCHES_COLLECTION, [
+        { field: "businessId", operator: "==", value: businessId },
+      ]),
       FirestoreService.getAll<FirestoreEntityWithId>(BOOKINGS_COLLECTION, [
         { field: "businessId", operator: "==", value: businessId },
       ]),
-      // Compatibilidad con citas legacy que puedan tener businessId persistido.
-      FirestoreService.getAll<FirestoreEntityWithId>(APPOINTMENTS_COLLECTION, [
+      FirestoreService.getAll<AppointmentDeletionRecord>(APPOINTMENTS_COLLECTION, [
+        { field: "businessId", operator: "==", value: businessId },
+      ]),
+      FirestoreService.getAll<FirestoreEntityWithId>(REVIEWS_COLLECTION, [
+        { field: "businessId", operator: "==", value: businessId },
+      ]),
+      FirestoreService.getAll<FirestoreEntityWithId>(METRICS_COLLECTION, [
         { field: "businessId", operator: "==", value: businessId },
       ]),
     ]);
 
     const appointmentsByBookingList = await Promise.all(
       bookings.map((booking) =>
-        FirestoreService.getAll<FirestoreEntityWithId>(APPOINTMENTS_COLLECTION, [
+        FirestoreService.getAll<AppointmentDeletionRecord>(APPOINTMENTS_COLLECTION, [
           { field: "bookingId", operator: "==", value: booking.id },
         ])
       )
     );
 
-    const appointmentIds = new Set<string>();
-    appointmentsByBusiness.forEach((appointment) => appointmentIds.add(appointment.id));
+    const appointmentsById = new Map<string, AppointmentDeletionRecord>();
+    appointmentsByBusiness.forEach((appointment) => appointmentsById.set(appointment.id, appointment));
     appointmentsByBookingList
       .flat()
-      .forEach((appointment) => appointmentIds.add(appointment.id));
+      .forEach((appointment) => appointmentsById.set(appointment.id, appointment));
 
-    await Promise.all(
-      Array.from(appointmentIds).map((appointmentId) =>
-        FirestoreService.delete(APPOINTMENTS_COLLECTION, appointmentId)
+    const branchIds = normalizeUniqueStrings(branches.map((branch) => branch.id));
+    const appointmentRecords = Array.from(appointmentsById.values());
+    const employeeUsers = await this.resolveUsersForMemberships(
+      memberships.filter((membership) => membership.isEmployee === true)
+    );
+    const employeeMetricIdentifiers = this.buildEmployeeMetricIdentifiers(
+      memberships,
+      appointmentRecords,
+      employeeUsers
+    );
+
+    const [branchMetricsByBranch, employeeMetricsByEmployee] = await Promise.all([
+      Promise.all(
+        branchIds.map((branchId) =>
+          FirestoreService.getAll<FirestoreEntityWithId>(METRICS_COLLECTION, [
+            { field: "type", operator: "==", value: "BRANCH" },
+            { field: "branchId", operator: "==", value: branchId },
+          ])
+        )
+      ),
+      Promise.all(
+        employeeMetricIdentifiers.map((employeeId) =>
+          FirestoreService.getAll<FirestoreEntityWithId>(METRICS_COLLECTION, [
+            { field: "type", operator: "==", value: "EMPLOYEE" },
+            { field: "employeeId", operator: "==", value: employeeId },
+          ])
+        )
+      ),
+    ]);
+
+    return {
+      appointmentIds: normalizeUniqueStrings(appointmentRecords.map((appointment) => appointment.id)),
+      bookingIds: normalizeUniqueStrings(bookings.map((booking) => booking.id)),
+      branchIds,
+      membershipIds: normalizeUniqueStrings(memberships.map((membership) => membership.id)),
+      metricIds: normalizeUniqueStrings([
+        ...businessMetrics.map((metric) => metric.id),
+        ...branchMetricsByBranch.flat().map((metric) => metric.id),
+        ...employeeMetricsByEmployee.flat().map((metric) => metric.id),
+      ]),
+      reviewIds: normalizeUniqueStrings(reviews.map((review) => review.id)),
+      roleIds: normalizeUniqueStrings(roles.map((role) => role.id)),
+      serviceIds: normalizeUniqueStrings(services.map((service) => service.id)),
+      users: await this.resolveUsersForMemberships(memberships),
+    };
+  }
+
+  private async resolveUsersForMemberships(
+    memberships: BusinessMembership[]
+  ): Promise<User[]> {
+    const membershipUserIds = normalizeUniqueStrings(
+      memberships.map((membership) => membership.userId)
+    );
+    if (membershipUserIds.length === 0) {
+      return [];
+    }
+
+    const [usersById, usersByDocument] = await Promise.all([
+      this.getUsersByField("id", membershipUserIds),
+      this.getUsersByField("document", membershipUserIds),
+    ]);
+
+    const usersByResolvedId = new Map<string, User>();
+    usersById.forEach((user) => usersByResolvedId.set(user.id, user));
+    usersByDocument.forEach((user) => usersByResolvedId.set(user.id, user));
+
+    return Array.from(usersByResolvedId.values());
+  }
+
+  private async getUsersByField(
+    field: "id" | "document",
+    values: string[]
+  ): Promise<User[]> {
+    if (values.length === 0) {
+      return [];
+    }
+
+    const chunkSize = 30;
+    const chunks: string[][] = [];
+    for (let index = 0; index < values.length; index += chunkSize) {
+      chunks.push(values.slice(index, index + chunkSize));
+    }
+
+    const results = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<User>(USERS_COLLECTION, [
+          { field, operator: "in", value: chunk },
+        ])
       )
     );
+
+    return results.flat();
+  }
+
+  private buildEmployeeMetricIdentifiers(
+    memberships: BusinessMembership[],
+    appointments: AppointmentDeletionRecord[],
+    users: User[]
+  ): string[] {
+    const membershipEmployeeIds = memberships
+      .filter((membership) => membership.isEmployee === true)
+      .map((membership) => membership.userId);
+    const appointmentEmployeeIds = appointments.map((appointment) => appointment.employeeId);
+    const resolvedUserIds = users.flatMap((user) => [user.id, user.document]);
+
+    return normalizeUniqueStrings([
+      ...membershipEmployeeIds,
+      ...appointmentEmployeeIds,
+      ...resolvedUserIds,
+    ]);
+  }
+
+  private async deleteAppointmentStatusTasks(appointmentIds: string[]): Promise<void> {
+    if (this.appointmentStatusTaskScheduler == null) {
+      return;
+    }
+
     await Promise.all(
-      bookings.map((booking) => FirestoreService.delete(BOOKINGS_COLLECTION, booking.id))
-    );
-    await Promise.all(
-      services.map((service) => FirestoreService.delete(SERVICES_COLLECTION, service.id))
-    );
-    await Promise.all(
-      branches.map((branch) => FirestoreService.delete(BRANCHES_COLLECTION, branch.id))
+      normalizeUniqueStrings(appointmentIds).map(async (appointmentId) => {
+        try {
+          await this.appointmentStatusTaskScheduler!.deleteAppointmentStatusTasks({
+            appointmentId,
+          });
+        } catch (taskError) {
+          const detail =
+            taskError instanceof Error
+              ? taskError.message
+              : typeof taskError === "string"
+                ? taskError
+                : JSON.stringify(taskError);
+
+          logger.warn(
+            `[BusinessService] No se pudieron eliminar tasks automáticas para appointment ${appointmentId} durante la eliminación del negocio. detalle=${detail}`
+          );
+        }
+      })
     );
   }
 
-  private async deleteBusinessStorageFolder(businessId: string): Promise<void> {
-    const storagePrefix = `bussinesses/${businessId}/`;
-    const bucket = FirestoreDataBase.getAdmin().storage().bucket();
-    await bucket.deleteFiles({ prefix: storagePrefix });
+  private async deleteUserBusinessMembershipLinks(
+    users: User[],
+    businessId: string,
+    membershipIds: Set<string>
+  ): Promise<void> {
+    const normalizedBusinessId = businessId.trim();
+    if (normalizedBusinessId === "") {
+      return;
+    }
+
+    await Promise.all(
+      users.map(async (user) => {
+        const links = await FirestoreService.getAllFromSubcollection<FirestoreMembershipLinkDoc>(
+          USERS_COLLECTION,
+          user.id,
+          USER_BUSINESS_MEMBERSHIPS_SUBCOLLECTION
+        );
+
+        const linkIdsToDelete = links
+          .filter((link) => {
+            const linkBusinessId = link.businessId?.trim() ?? "";
+            const linkMembershipId = link.membershipId?.trim() ?? "";
+
+            return (
+              linkBusinessId === normalizedBusinessId ||
+              membershipIds.has(linkMembershipId) ||
+              membershipIds.has(link.id)
+            );
+          })
+          .map((link) => link.id);
+
+        await Promise.all(
+          linkIdsToDelete.map((linkId) =>
+            FirestoreService.deleteSubcollectionDocument(
+              USERS_COLLECTION,
+              user.id,
+              USER_BUSINESS_MEMBERSHIPS_SUBCOLLECTION,
+              linkId
+            )
+          )
+        );
+      })
+    );
+  }
+
+  private async deleteRoleDocuments(roleIds: string[]): Promise<void> {
+    await Promise.all(
+      normalizeUniqueStrings(roleIds).map(async (roleId) => {
+        await FirestoreService.deleteSubcollectionDocuments(
+          ROLES_COLLECTION,
+          roleId,
+          ROLE_PERMISSIONS_SUBCOLLECTION
+        );
+        await this.deleteDocumentIfExists(ROLES_COLLECTION, roleId);
+      })
+    );
+  }
+
+  private async deleteDocuments(
+    collectionName: string,
+    ids: string[]
+  ): Promise<void> {
+    await Promise.all(
+      normalizeUniqueStrings(ids).map((id) =>
+        this.deleteDocumentIfExists(collectionName, id)
+      )
+    );
+  }
+
+  private async deleteDocumentIfExists(
+    collectionName: string,
+    id: string
+  ): Promise<void> {
+    try {
+      await FirestoreService.delete(collectionName, id);
+    } catch (error) {
+      if (
+        error instanceof CustomError &&
+        error.statusCode === 404
+      ) {
+        return;
+      }
+      throw error;
+    }
   }
 
   private async syncServices(
@@ -517,17 +800,26 @@ export class BusinessService {
     }
 
     const toDelete = existingServices.filter(
-      (service) => !namesInRequest.has(toNameKey(service.name))
+      (service) =>
+        service.status !== "DELETED" && !namesInRequest.has(toNameKey(service.name))
     );
-    await Promise.all(
-      toDelete.map((service) =>
-        FirestoreService.update(SERVICES_COLLECTION, service.id, {
-          status: "DELETED" as const,
-          deletedAt: FirestoreDataBase.generateTimeStamp(),
-          updatedAt: FirestoreDataBase.generateTimeStamp(),
-        })
-      )
-    );
+    if (toDelete.length > 0) {
+      if (this.serviceService) {
+        await Promise.all(
+          toDelete.map((service) => this.serviceService!.deleteService(service.id))
+        );
+      } else {
+        await Promise.all(
+          toDelete.map((service) =>
+            FirestoreService.update(SERVICES_COLLECTION, service.id, {
+              status: "DELETED" as const,
+              deletedAt: FirestoreDataBase.generateTimeStamp(),
+              updatedAt: FirestoreDataBase.generateTimeStamp(),
+            })
+          )
+        );
+      }
+    }
   }
 
   private async syncBranches(
@@ -586,17 +878,26 @@ export class BusinessService {
     }
 
     const toDelete = existingBranches.filter(
-      (branch) => !namesInRequest.has(toNameKey(branch.name))
+      (branch) =>
+        branch.status !== "DELETED" && !namesInRequest.has(toNameKey(branch.name))
     );
-    await Promise.all(
-      toDelete.map((branch) =>
-        FirestoreService.update(BRANCHES_COLLECTION, branch.id, {
-          status: "DELETED" as const,
-          deletedAt: FirestoreDataBase.generateTimeStamp(),
-          updatedAt: FirestoreDataBase.generateTimeStamp(),
-        })
-      )
-    );
+    if (toDelete.length > 0) {
+      if (this.branchService) {
+        await Promise.all(
+          toDelete.map((branch) => this.branchService!.deleteBranch(branch.id))
+        );
+      } else {
+        await Promise.all(
+          toDelete.map((branch) =>
+            FirestoreService.update(BRANCHES_COLLECTION, branch.id, {
+              status: "DELETED" as const,
+              deletedAt: FirestoreDataBase.generateTimeStamp(),
+              updatedAt: FirestoreDataBase.generateTimeStamp(),
+            })
+          )
+        );
+      }
+    }
   }
 
   private normalizeBusiness(business: Business): Business {

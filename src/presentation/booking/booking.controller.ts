@@ -5,6 +5,7 @@ import {
   MAX_PAGE_SIZE,
 } from "../../domain/interfaces/pagination.interface";
 import type { BookingService } from "../services/booking.service";
+import { validateAddBookingPaymentAmount } from "./dtos/add-booking-payment.dto";
 import { validateCreateBookingDto } from "./dtos/create-booking.dto";
 import {
   validateBookingIdParam,
@@ -81,6 +82,17 @@ export class BookingController {
       .createBooking(dto)
       .then((booking) => {
         res.status(201).json(booking);
+      })
+      .catch(next);
+  };
+
+  public addPayment = (req: Request, res: Response, next: NextFunction) => {
+    const id = validateBookingIdParam(req.params.id);
+    const amount = validateAddBookingPaymentAmount(req.body);
+    this.bookingService
+      .addPayment(id, amount)
+      .then((booking) => {
+        res.status(200).json(booking);
       })
       .catch(next);
   };
