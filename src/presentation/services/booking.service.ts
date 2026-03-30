@@ -30,6 +30,7 @@ import { logger } from "../../infrastructure/logger/logger";
 import type { WhatsAppService } from "./whatsapp.service";
 import { UserService } from "./user.service";
 import { BookingConsecutiveService } from "./booking-consecutive.service";
+import type { PushNotificationService } from "./push-notification.service";
 
 const BOOKINGS_COLLECTION = "Bookings";
 const BUSINESSES_COLLECTION = "Businesses";
@@ -42,6 +43,7 @@ export class BookingService {
     private readonly reviewService: ReviewService = new ReviewService(),
     private readonly appointmentStatusTaskScheduler?: AppointmentStatusTaskScheduler,
     private readonly whatsAppService?: WhatsAppService,
+    private readonly pushNotificationService?: PushNotificationService,
     private readonly userService: UserService = new UserService(),
     private readonly bookingConsecutiveService: BookingConsecutiveService =
       new BookingConsecutiveService(),
@@ -269,6 +271,32 @@ export class BookingService {
           `[BookingService] No se pudo enviar WhatsApp de confirmación para booking ${createdBooking.id}. detalle=${detail}`
         );
       });
+
+      await this.pushNotificationService
+        ?.notifyBookingCreated({
+          businessId: dto.businessId,
+          branchId: dto.branchId,
+          bookingId: createdBooking.id,
+          bookingConsecutive: consecutive,
+          clientDocument: dto.clientId,
+          employeeIds: createdAppointments.map((appointment) => appointment.employeeId),
+          appointments: createdAppointments.map((appointment) => ({
+            date: appointment.date,
+            startTime: appointment.startTime,
+          })),
+        })
+        .catch((pushNotificationError) => {
+          const detail =
+            pushNotificationError instanceof Error
+              ? pushNotificationError.message
+              : typeof pushNotificationError === "string"
+                ? pushNotificationError
+                : JSON.stringify(pushNotificationError);
+
+          logger.warn(
+            `[BookingService] No se pudo enviar notificación push para booking ${createdBooking.id}. detalle=${detail}`
+          );
+        });
 
       const createdBookingDoc = await this.getBookingById(createdBooking.id);
       return createdBookingDoc;

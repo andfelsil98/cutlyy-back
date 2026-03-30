@@ -5,6 +5,7 @@ import { createWhatsAppService } from "../../infrastructure/whatsapp/whatsapp.se
 import { AppointmentController } from "./appointment.controller";
 import { AppointmentService } from "../services/appointment.service";
 import { AppointmentStatusTaskSchedulerService } from "../services/appointment-status-task-scheduler.service";
+import { PushNotificationService } from "../services/push-notification.service";
 
 export class AppointmentRoutes {
   static get routes(): Router {
@@ -17,13 +18,15 @@ export class AppointmentRoutes {
         internalToken: envs.CLOUD_TASKS_INTERNAL_TOKEN,
       });
     const whatsAppService = createWhatsAppService();
+    const pushNotificationService = new PushNotificationService();
 
     const appointmentService = new AppointmentService(
       undefined,
       appointmentStatusTaskScheduler,
       undefined,
       undefined,
-      whatsAppService
+      whatsAppService,
+      pushNotificationService
     );
     const appointmentController = new AppointmentController(appointmentService);
 

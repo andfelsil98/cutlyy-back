@@ -46,4 +46,8 @@ export const envs = {
     .get("CLOUD_TASKS_INTERNAL_TOKEN")
     .default("REPLACE_ME_INTERNAL_TASK_TOKEN")
     .asString(),
+  PUSH_NOTIFICATIONS_ENABLED: env
+    .get("PUSH_NOTIFICATIONS_ENABLED")
+    .default("true")
+    .asBool(),
 };

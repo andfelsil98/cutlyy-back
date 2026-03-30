@@ -6,6 +6,7 @@ import { AppointmentStatusTaskSchedulerService } from "../services/appointment-s
 import { AppointmentService } from "../services/appointment.service";
 import { BookingController } from "./booking.controller";
 import { BookingService } from "../services/booking.service";
+import { PushNotificationService } from "../services/push-notification.service";
 
 export class BookingRoutes {
   static get routes(): Router {
@@ -20,14 +21,20 @@ export class BookingRoutes {
 
     const appointmentService = new AppointmentService(
       undefined,
-      appointmentStatusTaskScheduler
+      appointmentStatusTaskScheduler,
+      undefined,
+      undefined,
+      undefined,
+      new PushNotificationService()
     );
     const whatsAppService = createWhatsAppService();
+    const pushNotificationService = new PushNotificationService();
     const bookingService = new BookingService(
       appointmentService,
       undefined,
       appointmentStatusTaskScheduler,
-      whatsAppService
+      whatsAppService,
+      pushNotificationService
     );
     const bookingController = new BookingController(bookingService);
 

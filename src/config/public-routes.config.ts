@@ -55,4 +55,6 @@ export const BUSINESS_ID_HEADER_EXEMPT_METHOD_PATHS: Array<{
   { method: "POST", path: "/api/plans" },
   { method: "PUT", path: "/api/plans", match: "prefix" },
   { method: "DELETE", path: "/api/plans", match: "prefix" },
+  { method: "POST", path: "/api/push-notifications", match: "prefix" },
+  { method: "DELETE", path: "/api/push-notifications", match: "prefix" },
 ];

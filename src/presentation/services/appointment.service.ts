@@ -32,6 +32,7 @@ import { MetricService } from "./metric.service";
 import { BookingConsecutiveService } from "./booking-consecutive.service";
 import type { WhatsAppService } from "./whatsapp.service";
 import { UserService } from "./user.service";
+import type { PushNotificationService } from "./push-notification.service";
 
 const COLLECTION_NAME = "Appointments";
 const BOOKINGS_COLLECTION = "Bookings";
@@ -138,6 +139,7 @@ export class AppointmentService {
     private readonly bookingConsecutiveService: BookingConsecutiveService =
       new BookingConsecutiveService(),
     private readonly whatsAppService?: WhatsAppService,
+    private readonly pushNotificationService?: PushNotificationService,
     private readonly userService: UserService = new UserService(),
     private readonly businessUsageLimitService: BusinessUsageLimitService =
       new BusinessUsageLimitService()
@@ -432,6 +434,34 @@ export class AppointmentService {
           `[AppointmentService] No se pudo enviar WhatsApp de confirmación para booking ${createdBooking.id}. detalle=${detail}`
         );
       });
+
+      await this.pushNotificationService
+        ?.notifyBookingCreated({
+          businessId: dto.businessId,
+          branchId: dto.branchId,
+          bookingId: createdBooking.id,
+          bookingConsecutive: consecutive,
+          clientDocument: dto.clientId,
+          employeeIds: [createdAppointment.employeeId],
+          appointments: [
+            {
+              date: createdAppointment.date,
+              startTime: createdAppointment.startTime,
+            },
+          ],
+        })
+        .catch((pushNotificationError) => {
+          const detail =
+            pushNotificationError instanceof Error
+              ? pushNotificationError.message
+              : typeof pushNotificationError === "string"
+                ? pushNotificationError
+                : JSON.stringify(pushNotificationError);
+
+          logger.warn(
+            `[AppointmentService] No se pudo enviar notificación push para booking ${createdBooking.id}. detalle=${detail}`
+          );
+        });
 
       return createdAppointment;
     } catch (error) {

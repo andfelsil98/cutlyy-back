@@ -14,6 +14,7 @@ import { ReviewRoutes } from "./review/routes";
 import { WhatsAppRoutes } from "./whatsapp/routes";
 import { MetricsRoutes } from "./metrics/routes";
 import { PlanRoutes } from "./plan/routes";
+import { PushNotificationsRoutes } from "./push-notifications/routes";
 
 export class AppRoutes {
   static get routes(): Router {
@@ -33,6 +34,7 @@ export class AppRoutes {
     router.use("/api/whatsapp", WhatsAppRoutes.routes);
     router.use("/api/metrics", MetricsRoutes.routes);
     router.use("/api/plans", PlanRoutes.routes);
+    router.use("/api/push-notifications", PushNotificationsRoutes.routes);
     return router;
   }
 }
