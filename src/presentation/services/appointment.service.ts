@@ -1646,7 +1646,13 @@ export class AppointmentService {
       );
     }
 
-    if (appointmentDateTime.getTime() < Date.now()) {
+    // Interpretar la fecha/hora del agendamiento como hora de Colombia (UTC-5, sin DST).
+    // Convertirla a UTC para comparar correctamente sin depender del timezone del servidor.
+    const BOGOTA_OFFSET_MS = 5 * 60 * 60 * 1000; // UTC-5
+    const ONE_MINUTE_MS = 60 * 1000;
+    const apptUtcMs = Date.UTC(year, month - 1, day, hours, minutes) + BOGOTA_OFFSET_MS;
+
+    if (apptUtcMs <= Date.now() + ONE_MINUTE_MS) {
       throw CustomError.badRequest(
         "La fecha y hora de la cita no pueden ser anteriores al momento actual"
       );

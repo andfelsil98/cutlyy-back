@@ -9,7 +9,8 @@
     "dev": "tsx watch src/app.ts",
     "build": "rimraf ./dist && tsup src/app.ts --format esm --platform node --target node22 --out-dir dist",
     "typecheck": "tsc --noEmit",
-    "start": "node dist/app.js"
+    "start": "node dist/app.js",
+    "deploy:dev": "gcloud run deploy barber-app-dev --project=barber-app-dev-c7f59 --region=us-central1 --source=. --service-account=59909399828-compute@developer.gserviceaccount.com --allow-unauthenticated --set-env-vars=ENV=development,FIREBASE_CREDENTIALS_PATH=/secrets/firebase/firebase-credentials.json,INFOBIP_BASE_URL=https://rkpvpy.api.infobip.com,INFOBIP_WHATSAPP_SENDER=573185864111,INFOBIP_TIMEOUT_MS=10000,CLOUD_TASKS_PROJECT_ID=barber-app-dev-c7f59,CLOUD_TASKS_LOCATION=us-central1,CLOUD_TASKS_QUEUE=booking-queue,CLOUD_TASKS_MAX_ATTEMPTS=5,CLOUD_TASKS_TARGET_BASE_URL=https://api.dev.cutlyy.com,PUSH_NOTIFICATIONS_ENABLED=true --update-secrets=/secrets/firebase/firebase-credentials.json=firebase-credentials:latest,INFOBIP_API_KEY=infobip-api-key:latest,CLOUD_TASKS_INTERNAL_TOKEN=cloud-tasks-internal-token:latest"
   },
   "engines": {
     "node": "22.x"

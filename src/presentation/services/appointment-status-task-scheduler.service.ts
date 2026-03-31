@@ -156,8 +156,17 @@ export class AppointmentStatusTaskSchedulerService
     const hours = Number(timeMatch[1]);
     const minutes = Number(timeMatch[2]);
 
-    const scheduledDate = new Date(year, month - 1, day, hours, minutes, 0, 0);
-    const delayMs = scheduledDate.getTime() - Date.now();
+    // Interpretar la hora como Colombia (UTC-5, sin DST) y agregar 30s de gracia
+    // para garantizar que el appointment esté persistido en Firestore antes de que
+    // el task se ejecute.
+    const BOGOTA_OFFSET_MS = 5 * 60 * 60 * 1000;
+    const TASK_EXECUTION_OFFSET_MS = 30 * 1000;
+    const scheduledUtcMs =
+      Date.UTC(year, month - 1, day, hours, minutes) +
+      BOGOTA_OFFSET_MS +
+      TASK_EXECUTION_OFFSET_MS;
+
+    const delayMs = scheduledUtcMs - Date.now();
     if (!Number.isFinite(delayMs) || delayMs <= 0) {
       return 0;
     }
