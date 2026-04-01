@@ -496,6 +496,17 @@ export class BookingService {
         );
       }
 
+      let cancellationNotificationAppointments: Appointment[] = [];
+      if (
+        !hasBookingEditChanges &&
+        dto.status === "CANCELLED" &&
+        existingBooking.status !== "CANCELLED"
+      ) {
+        cancellationNotificationAppointments = (
+          await this.appointmentService.getAppointmentsByIds(normalizedAppointmentIds)
+        ).filter((appointment) => appointment.status !== "DELETED");
+      }
+
       let totalAmount = existingBooking.totalAmount;
       let paidAmount = dto.paidAmount ?? existingBooking.paidAmount;
       let paymentStatus = existingBooking.paymentStatus;
@@ -638,6 +649,40 @@ export class BookingService {
             `[BookingService] No se pudo enviar WhatsApp de FINISHED para booking ${existingBooking.id}. detalle=${detail}`
           );
         });
+      }
+
+      if (
+        !hasBookingEditChanges &&
+        dto.status === "CANCELLED" &&
+        existingBooking.status !== "CANCELLED"
+      ) {
+        await this.pushNotificationService
+          ?.notifyBookingCancelled({
+            businessId: existingBooking.businessId,
+            branchId: existingBooking.branchId,
+            bookingId: existingBooking.id,
+            bookingConsecutive: existingBooking.consecutive,
+            clientDocument: existingBooking.clientId,
+            employeeIds: cancellationNotificationAppointments.map(
+              (appointment) => appointment.employeeId
+            ),
+            appointments: cancellationNotificationAppointments.map((appointment) => ({
+              date: appointment.date,
+              startTime: appointment.startTime,
+            })),
+          })
+          .catch((pushNotificationError) => {
+            const detail =
+              pushNotificationError instanceof Error
+                ? pushNotificationError.message
+                : typeof pushNotificationError === "string"
+                  ? pushNotificationError
+                  : JSON.stringify(pushNotificationError);
+
+            logger.warn(
+              `[BookingService] No se pudo enviar notificación push de cancelación para booking ${existingBooking.id}. detalle=${detail}`
+            );
+          });
       }
 
       return await this.getBookingById(id);

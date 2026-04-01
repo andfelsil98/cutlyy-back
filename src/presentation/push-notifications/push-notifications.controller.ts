@@ -6,18 +6,36 @@ import {
   validateUpsertPushNotificationSubscriptionDto,
 } from "./dtos/upsert-push-notification-subscription.dto";
 
-function resolveAuthenticatedUserDocument(req: Request): string {
+interface AuthenticatedPushRequester {
+  document?: string;
+  email?: string;
+}
+
+function resolveAuthenticatedPushRequester(req: Request): AuthenticatedPushRequester {
   const decodedToken = req.decodedIdToken as Record<string, unknown> | undefined;
   const documentRaw = decodedToken?.document;
+  const emailRaw = decodedToken?.email;
 
-  if (typeof documentRaw !== "string" || documentRaw.trim() === "") {
+  const document =
+    typeof documentRaw === "string" && documentRaw.trim() !== ""
+      ? documentRaw.trim()
+      : undefined;
+  const email =
+    typeof emailRaw === "string" && emailRaw.trim() !== ""
+      ? emailRaw.trim().toLowerCase()
+      : undefined;
+
+  if (document == null && email == null) {
     throw CustomError.unauthorized(
-      "No se pudo resolver el documento del usuario autenticado",
-      "SESSION_DOCUMENT_REQUIRED"
+      "No se pudo resolver la identidad del usuario autenticado",
+      "SESSION_IDENTITY_REQUIRED"
     );
   }
 
-  return documentRaw.trim();
+  return {
+    ...(document !== undefined && { document }),
+    ...(email !== undefined && { email }),
+  };
 }
 
 export class PushNotificationsController {
@@ -27,11 +45,11 @@ export class PushNotificationsController {
 
   public upsertSubscription = (req: Request, res: Response, next: NextFunction) => {
     try {
-      const requesterDocument = resolveAuthenticatedUserDocument(req);
+      const requester = resolveAuthenticatedPushRequester(req);
       const dto = validateUpsertPushNotificationSubscriptionDto(req.body);
 
       this.pushNotificationService
-        .upsertSubscription(requesterDocument, dto)
+        .upsertSubscription(requester, dto)
         .then((result) => {
           res.status(200).json(result);
         })
@@ -43,11 +61,11 @@ export class PushNotificationsController {
 
   public deleteSubscription = (req: Request, res: Response, next: NextFunction) => {
     try {
-      const requesterDocument = resolveAuthenticatedUserDocument(req);
+      const requester = resolveAuthenticatedPushRequester(req);
       const deviceId = validatePushNotificationDeviceIdParam(req.params.deviceId);
 
       this.pushNotificationService
-        .deleteSubscription(requesterDocument, deviceId)
+        .deleteSubscription(requester, deviceId)
         .then((result) => {
           res.status(200).json(result);
         })

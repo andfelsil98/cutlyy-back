@@ -46,6 +46,10 @@ export const envs = {
     .get("CLOUD_TASKS_INTERNAL_TOKEN")
     .default("REPLACE_ME_INTERNAL_TASK_TOKEN")
     .asString(),
+  FRONTEND_APP_BASE_URL: env
+    .get("FRONTEND_APP_BASE_URL")
+    .default("http://localhost:5173")
+    .asString(),
   PUSH_NOTIFICATIONS_ENABLED: env
     .get("PUSH_NOTIFICATIONS_ENABLED")
     .default("true")
