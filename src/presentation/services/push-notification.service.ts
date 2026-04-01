@@ -467,18 +467,29 @@ export class PushNotificationService {
     if (recipients.length === 0) return;
 
     const messaging = FirestoreDataBase.getAdmin().messaging();
+    const notificationLink = this.resolveFrontendNotificationLink(payload.url);
 
     for (const chunk of this.chunkRecipients(recipients, MAX_MULTICAST_TOKENS)) {
       logger.info(
-        `[PushNotificationService] Enviando push '${payload.tag}' a chunk de ${chunk.length} dispositivos. tokenRefs=${this.summarizeIdentifiers(chunk.map((recipient) => this.maskToken(recipient.token)))}`
+        `[PushNotificationService] Enviando push '${payload.tag}' a chunk de ${chunk.length} dispositivos. link=${notificationLink}, tokenRefs=${this.summarizeIdentifiers(chunk.map((recipient) => this.maskToken(recipient.token)))}`
       );
 
       const response = await messaging.sendEachForMulticast({
+        notification: {
+          title: payload.title,
+          body: payload.body,
+        },
         tokens: chunk.map((recipient) => recipient.token),
         data: payload.data,
         webpush: {
           headers: {
             Urgency: "high",
+          },
+          fcmOptions: {
+            link: notificationLink,
+          },
+          notification: {
+            tag: payload.tag,
           },
         },
       });
@@ -566,6 +577,17 @@ export class PushNotificationService {
     const normalizedToken = token.trim();
     if (normalizedToken.length <= 12) return normalizedToken;
     return `${normalizedToken.slice(0, 6)}...${normalizedToken.slice(-6)}`;
+  }
+
+  private resolveFrontendNotificationLink(targetUrl: string): string {
+    const normalizedBaseUrl = envs.FRONTEND_APP_BASE_URL.trim();
+    if (normalizedBaseUrl === "") {
+      throw CustomError.internalServerError(
+        "FRONTEND_APP_BASE_URL es requerido para construir el link absoluto de notificaciones push"
+      );
+    }
+
+    return new URL(targetUrl, normalizedBaseUrl).toString();
   }
 
   private formatDateLabel(date: string): string {
