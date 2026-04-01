@@ -475,10 +475,6 @@ export class PushNotificationService {
       );
 
       const response = await messaging.sendEachForMulticast({
-        notification: {
-          title: payload.title,
-          body: payload.body,
-        },
         tokens: chunk.map((recipient) => recipient.token),
         data: payload.data,
         webpush: {
@@ -487,9 +483,6 @@ export class PushNotificationService {
           },
           fcmOptions: {
             link: notificationLink,
-          },
-          notification: {
-            tag: payload.tag,
           },
         },
       });

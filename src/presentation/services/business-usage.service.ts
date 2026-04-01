@@ -326,15 +326,39 @@ export class BusinessUsageService {
         db
           .collectionGroup(USAGE_SUBCOLLECTION)
           .where("nextStatusChangeDate", "<=", today)
-          .get(),
+          .get()
+          .catch((error: unknown) => {
+            this.logUsageReconcileQueryError({
+              error,
+              queryName: "dueSnapshot",
+              filters: [["nextStatusChangeDate", "<=", today]],
+            });
+            throw error;
+          }),
         db
           .collectionGroup(USAGE_SUBCOLLECTION)
           .where("startPeriod", "==", today)
-          .get(),
+          .get()
+          .catch((error: unknown) => {
+            this.logUsageReconcileQueryError({
+              error,
+              queryName: "activationSnapshot",
+              filters: [["startPeriod", "==", today]],
+            });
+            throw error;
+          }),
         db
           .collectionGroup(USAGE_SUBCOLLECTION)
           .where("endPeriod", "==", yesterday)
-          .get(),
+          .get()
+          .catch((error: unknown) => {
+            this.logUsageReconcileQueryError({
+              error,
+              queryName: "deactivationSnapshot",
+              filters: [["endPeriod", "==", yesterday]],
+            });
+            throw error;
+          }),
       ]);
 
     const businessIds = Array.from(
@@ -553,6 +577,30 @@ export class BusinessUsageService {
       message.includes("FAILED_PRECONDITION") ||
       message.toLowerCase().includes("requires an index") ||
       message.toLowerCase().includes("index")
+    );
+  }
+
+  private logUsageReconcileQueryError(input: {
+    error: unknown;
+    queryName: string;
+    filters: Array<[string, string, string]>;
+  }): void {
+    const errorObject =
+      typeof input.error === "object" && input.error != null
+        ? (input.error as Record<string, unknown>)
+        : null;
+
+    logger.error(
+      `[BusinessUsageService] reconcileDueUsageTransitionsForToday query failed. ${JSON.stringify({
+        queryName: input.queryName,
+        collectionGroup: USAGE_SUBCOLLECTION,
+        filters: input.filters,
+        message: input.error instanceof Error ? input.error.message : String(input.error),
+        code: errorObject?.code ?? null,
+        details: errorObject?.details ?? null,
+        metadata: errorObject?.metadata ?? null,
+        error: errorObject,
+      })}`
     );
   }
 
