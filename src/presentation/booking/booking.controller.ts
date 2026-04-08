@@ -11,6 +11,7 @@ import {
 import type { BookingService } from "../services/booking.service";
 import { validateAddBookingPaymentAmount } from "./dtos/add-booking-payment.dto";
 import { validateCreateBookingDto } from "./dtos/create-booking.dto";
+import { validateUpdateBookingPaymentMethodDto } from "./dtos/update-booking-payment-method.dto";
 import {
   validateBookingIdParam,
   validateUpdateBookingDto,
@@ -120,6 +121,21 @@ export class BookingController {
     const amount = validateAddBookingPaymentAmount(req.body);
     this.bookingService
       .addPayment(id, amount)
+      .then((booking) => {
+        res.status(200).json(booking);
+      })
+      .catch(next);
+  };
+
+  public updatePaymentMethod = (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => {
+    const id = validateBookingIdParam(req.params.id);
+    const paymentMethod = validateUpdateBookingPaymentMethodDto(req.body);
+    this.bookingService
+      .updatePaymentMethod(id, paymentMethod)
       .then((booking) => {
         res.status(200).json(booking);
       })

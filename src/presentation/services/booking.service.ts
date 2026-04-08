@@ -2,9 +2,11 @@ import { FirestoreDataBase } from "../../data/firestore/firestore.database";
 import { FieldValue } from "firebase-admin/firestore";
 import { CustomError } from "../../domain/errors/custom-error";
 import type { Appointment } from "../../domain/interfaces/appointment.interface";
+import type { AppointmentStatus } from "../../domain/interfaces/appointment.interface";
 import type {
   Booking,
   BookingPaymentStatus,
+  BookingPaymentMethod,
   BookingStatus,
 } from "../../domain/interfaces/booking.interface";
 import { BOOKING_STATUSES } from "../../domain/interfaces/booking.interface";
@@ -21,6 +23,7 @@ import type {
   CreateBookingDto,
 } from "../booking/dtos/create-booking.dto";
 import type { UpdateBookingDto } from "../booking/dtos/update-booking.dto";
+import { BOOKING_PAYMENT_METHOD_UPDATE_OPTIONS } from "../booking/dtos/update-booking-payment-method.dto";
 import { BusinessUsageLimitService } from "./business-usage-limit.service";
 import FirestoreService from "./firestore.service";
 import { AppointmentService } from "./appointment.service";
@@ -36,6 +39,11 @@ const BOOKINGS_COLLECTION = "Bookings";
 const BUSINESSES_COLLECTION = "Businesses";
 const APPOINTMENTS_COLLECTION = "Appointments";
 const SERVICES_COLLECTION = "Services";
+const BOOKING_PAYMENT_METHOD_ALLOWED_APPOINTMENT_STATUSES: AppointmentStatus[] = [
+  "CREATED",
+  "IN_PROGRESS",
+  "FINISHED",
+];
 
 export class BookingService {
   constructor(
@@ -354,6 +362,49 @@ export class BookingService {
         id,
         beforeRevenueSnapshot
       );
+
+      return await this.getBookingById(id);
+    } catch (error) {
+      if (error instanceof CustomError) throw error;
+      throw CustomError.internalServerError("Error interno del servidor");
+    }
+  }
+
+  async updatePaymentMethod(
+    id: string,
+    paymentMethod: (typeof BOOKING_PAYMENT_METHOD_UPDATE_OPTIONS)[number]
+  ): Promise<Booking> {
+    try {
+      const booking = await this.getBookingById(id);
+      if (booking.status === "DELETED" || booking.status === "CANCELLED") {
+        throw CustomError.badRequest(
+          "No se puede cambiar el medio de pago de un agendamiento CANCELLED o DELETED"
+        );
+      }
+
+      const appointments = await this.appointmentService.getAppointmentsByIds(
+        booking.appointments
+      );
+      const canEditPaymentMethod = appointments.some((appointment) =>
+        BOOKING_PAYMENT_METHOD_ALLOWED_APPOINTMENT_STATUSES.includes(
+          appointment.status
+        )
+      );
+
+      if (!canEditPaymentMethod) {
+        throw CustomError.badRequest(
+          "Solo se puede cambiar el medio de pago cuando el agendamiento tiene citas en estado CREATED, IN_PROGRESS o FINISHED"
+        );
+      }
+
+      if (booking.paymentMethod === paymentMethod) {
+        return booking;
+      }
+
+      await FirestoreService.update(BOOKINGS_COLLECTION, id, {
+        paymentMethod,
+        updatedAt: FirestoreDataBase.generateTimeStamp(),
+      });
 
       return await this.getBookingById(id);
     } catch (error) {
@@ -1200,8 +1251,16 @@ export class BookingService {
       appointments,
       totalAmount,
       paidAmount,
+      paymentMethod: this.normalizePaymentMethod(booking.paymentMethod),
       paymentStatus: this.resolvePaymentStatus(totalAmount, paidAmount),
     };
+  }
+
+  private normalizePaymentMethod(
+    paymentMethod?: BookingPaymentMethod
+  ): BookingPaymentMethod {
+    if (paymentMethod == null) return "CASH";
+    return paymentMethod;
   }
 
   private resolvePaymentStatus(
