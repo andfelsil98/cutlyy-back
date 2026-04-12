@@ -15,7 +15,7 @@ function isDocumentTypeId(value: unknown): value is string {
 }
 
 export interface RegisterDto {
-  businessName: string;
+  businessName?: string;
   phone: string;
   name: string;
   email: string;
@@ -32,10 +32,18 @@ export function validateRegisterDto(body: unknown): RegisterDto {
   const b = body as Record<string, unknown>;
 
   const businessNameRaw = b.businessName;
-  if (typeof businessNameRaw !== "string" || businessNameRaw.trim() === "") {
-    throw CustomError.badRequest("businessName es requerido y debe ser un texto no vacío");
+  let businessName: string | undefined;
+  if (businessNameRaw !== undefined) {
+    if (typeof businessNameRaw !== "string") {
+      throw CustomError.badRequest(
+        "businessName debe ser un texto cuando se proporcione"
+      );
+    }
+    const normalizedBusinessName = normalizeSpaces(businessNameRaw);
+    if (normalizedBusinessName !== "") {
+      businessName = normalizedBusinessName;
+    }
   }
-  const businessName = normalizeSpaces(businessNameRaw);
 
   const phoneRaw = b.phone;
   if (typeof phoneRaw !== "string" || phoneRaw.trim() === "") {
@@ -93,7 +101,7 @@ export function validateRegisterDto(body: unknown): RegisterDto {
   }
 
   return {
-    businessName,
+    ...(businessName !== undefined && { businessName }),
     phone,
     name,
     email,

@@ -7,9 +7,38 @@ import {
 import type { UserService } from "../services/user.service";
 import { CustomError } from "../../domain/errors/custom-error";
 import { validateUpdateUserDto, validateUserIdParam } from "./dtos/update-user.dto";
+import { AccessControlService } from "../services/access-control.service";
 
 export class UsersController {
-  constructor(private readonly userService: UserService) {}
+  constructor(
+    private readonly userService: UserService,
+    private readonly accessControlService: AccessControlService = new AccessControlService()
+  ) {}
+
+  public publicLookup = (req: Request, res: Response, next: NextFunction) => {
+    const document =
+      typeof req.query.document === "string" && req.query.document.trim() !== ""
+        ? req.query.document.trim()
+        : undefined;
+
+    if (!document) {
+      res.status(400).json({
+        message: "document es requerido para la consulta pública de usuarios",
+      });
+      return;
+    }
+
+    this.userService
+      .getAllUsers({
+        page: 1,
+        pageSize: 20,
+        document,
+      })
+      .then((result) => {
+        res.status(200).json(result);
+      })
+      .catch(next);
+  };
 
   public getAllUsers = (req: Request, res: Response, next: NextFunction) => {
     const pageRaw =
@@ -39,15 +68,35 @@ export class UsersController {
       typeof req.query.name === "string" && req.query.name.trim() !== ""
         ? req.query.name.trim()
         : undefined;
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
 
-    this.userService
-      .getAllUsers({
+    const execute = async () => {
+      const isSelfLookup =
+        requesterDocument !== "" &&
+        ((document != null && document === requesterDocument) ||
+          (userId != null &&
+            (await this.userService.getByDocument(requesterDocument))?.id === userId));
+
+      if (!isSelfLookup) {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.users.list"
+        );
+      }
+
+      return this.userService.getAllUsers({
         page: pageRaw,
         pageSize,
         ...(userId != null && { userId }),
         ...(document != null && { document }),
         ...(name != null && { name }),
-      })
+      });
+    };
+
+    execute()
       .then((result) => {
         res.status(200).json(result);
       })
@@ -76,13 +125,18 @@ export class UsersController {
       return;
     }
 
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
     const deleteOpts = {
       ...(deletedByUid != null && { deletedByUid }),
       ...(deletedByEmail != null && { deletedByEmail }),
     };
 
-    this.userService
-      .deleteUser(document, deleteOpts)
+    this.accessControlService
+      .requireGlobalPermission(requesterDocument, "core.users.delete")
+      .then(() => this.userService.deleteUser(document, deleteOpts))
       .then((result) => {
         res.status(200).json(result);
       })
@@ -92,9 +146,28 @@ export class UsersController {
   public updateUser = (req: Request, res: Response, next: NextFunction) => {
     const id = validateUserIdParam(req.params.id);
     const dto = validateUpdateUserDto(req.body);
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
 
-    this.userService
-      .updateUser(id, dto)
+    const execute = async () => {
+      const requesterUser =
+        requesterDocument !== ""
+          ? await this.userService.getByDocument(requesterDocument)
+          : null;
+      const isSelfUpdate = requesterUser?.id === id;
+      if (!isSelfUpdate) {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.users.changeRole"
+        );
+      }
+
+      return this.userService.updateUser(id, dto);
+    };
+
+    execute()
       .then((user) => {
         res.status(200).json(user);
       })

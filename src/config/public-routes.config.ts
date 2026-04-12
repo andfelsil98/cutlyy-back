@@ -10,10 +10,7 @@ export const PUBLIC_ROUTE_PREFIXES: string[] = [
   "/auth",
   "/branches",
   "/services",
-  "/appointments",
-  "/modules",
-  "/permissions",
-  "/roles"
+  "/appointments"
 ];
 
 /**
@@ -26,8 +23,8 @@ export const PUBLIC_ROUTE_METHOD_PATHS: Array<{
   match?: "exact" | "prefix";
 }> = [
   { method: "GET", path: "/business" },
-  { method: "GET", path: "/business-memberships" },
-  { method: "GET", path: "/users" },
+  { method: "GET", path: "/business-memberships/public" },
+  { method: "GET", path: "/users/public-lookup" },
   { method: "GET", path: "/reviews" },
   { method: "GET", path: "/bookings", match: "prefix" },
   { method: "POST", path: "/reviews" },
@@ -57,4 +54,21 @@ export const BUSINESS_ID_HEADER_EXEMPT_METHOD_PATHS: Array<{
   { method: "DELETE", path: "/plans", match: "prefix" },
   { method: "POST", path: "/push-notifications", match: "prefix" },
   { method: "DELETE", path: "/push-notifications", match: "prefix" },
+  { method: "GET", path: "/roles" },
+  { method: "POST", path: "/roles" },
+  { method: "PUT", path: "/roles", match: "prefix" },
+  { method: "DELETE", path: "/roles", match: "prefix" },
+  { method: "GET", path: "/permissions" },
+  { method: "POST", path: "/permissions" },
+  { method: "DELETE", path: "/permissions", match: "prefix" },
+  { method: "GET", path: "/modules" },
+  { method: "POST", path: "/modules" },
+  { method: "DELETE", path: "/modules", match: "prefix" },
+  { method: "GET", path: "/users" },
+  { method: "PATCH", path: "/users", match: "prefix" },
+  { method: "DELETE", path: "/users", match: "prefix" },
+  { method: "GET", path: "/business-memberships" },
+  { method: "PATCH", path: "/business-memberships", match: "prefix" },
+  { method: "POST", path: "/business-memberships/assign-role" },
+  { method: "POST", path: "/business-memberships/assign-branch" },
 ];

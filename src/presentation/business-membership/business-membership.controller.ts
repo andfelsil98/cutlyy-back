@@ -1,6 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
 import type { BusinessMembershipService } from "../services/business-membership.service";
-import { isRootUserEmail } from "../../config/root-user-emails.config";
 import { CustomError } from "../../domain/errors/custom-error";
 import {
   validateAssignBranchDto,
@@ -14,11 +13,132 @@ import {
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
 } from "../../domain/interfaces/pagination.interface";
+import { AccessControlService } from "../services/access-control.service";
 
 export class BusinessMembershipController {
   constructor(
-    private readonly businessMembershipService: BusinessMembershipService
+    private readonly businessMembershipService: BusinessMembershipService,
+    private readonly accessControlService: AccessControlService = new AccessControlService()
   ) {}
+
+  private getRequesterDocument(req: Request): string {
+    const requesterDocumentRaw = req.decodedIdToken?.["document"];
+    if (
+      typeof requesterDocumentRaw !== "string" ||
+      requesterDocumentRaw.trim() === ""
+    ) {
+      throw CustomError.unauthorized(
+        "Token de sesión inválido: claim document no presente en el token."
+      );
+    }
+
+    return requesterDocumentRaw.trim();
+  }
+
+  private async requireScopedMembershipPermission(
+    req: Request,
+    membership: {
+      id: string;
+      businessId?: string | null;
+    },
+    input: {
+      globalPermission: string;
+      businessPermission: string;
+    }
+  ) {
+    const requesterDocument = this.getRequesterDocument(req);
+    const targetBusinessId = membership.businessId?.trim() ?? "";
+
+    if (targetBusinessId === "") {
+      await this.accessControlService.requireGlobalPermission(
+        requesterDocument,
+        input.globalPermission
+      );
+      return {
+        requesterDocument,
+        businessId: "",
+      };
+    }
+
+    const businessIdHeader = req.businessId?.trim() ?? "";
+    if (businessIdHeader === "") {
+      throw CustomError.badRequest(
+        "Se requiere el header businessId para operar sobre membresías de negocio."
+      );
+    }
+    if (businessIdHeader !== targetBusinessId) {
+      throw CustomError.badRequest(
+        "El businessId del header no coincide con la membresía a modificar."
+      );
+    }
+
+    await this.accessControlService.requireBusinessPermission(
+      requesterDocument,
+      targetBusinessId,
+      input.businessPermission
+    );
+
+    return {
+      requesterDocument,
+      businessId: targetBusinessId,
+    };
+  }
+
+  private async requireBusinessMembershipPermission(
+    req: Request,
+    membership: {
+      businessId?: string | null;
+    },
+    permissionInput: {
+      allOf?: string[];
+      anyOf?: string[];
+    }
+  ) {
+    const requesterDocument = this.getRequesterDocument(req);
+    const targetBusinessId = membership.businessId?.trim() ?? "";
+    if (targetBusinessId === "") {
+      throw CustomError.badRequest(
+        "Esta acción solo se puede ejecutar sobre membresías de negocio."
+      );
+    }
+
+    const businessIdHeader = req.businessId?.trim() ?? "";
+    if (businessIdHeader === "") {
+      throw CustomError.badRequest(
+        "Se requiere el header businessId para operar sobre membresías de negocio."
+      );
+    }
+    if (businessIdHeader !== targetBusinessId) {
+      throw CustomError.badRequest(
+        "El businessId del header no coincide con la membresía a modificar."
+      );
+    }
+
+    if (permissionInput.allOf && permissionInput.allOf.length > 0) {
+      await Promise.all(
+        permissionInput.allOf.map((permissionValue) =>
+          this.accessControlService.requireBusinessPermission(
+            requesterDocument,
+            targetBusinessId,
+            permissionValue
+          )
+        )
+      );
+    }
+
+    if (permissionInput.anyOf && permissionInput.anyOf.length > 0) {
+      await this.accessControlService.requireAnyBusinessPermission(
+        requesterDocument,
+        targetBusinessId,
+        permissionInput.anyOf
+      );
+    }
+
+    return {
+      requesterDocument,
+      businessId: targetBusinessId,
+    };
+  }
 
   public getAll = (req: Request, res: Response, next: NextFunction) => {
     const pageRaw =
@@ -87,10 +207,49 @@ export class BusinessMembershipController {
       .catch(next);
   };
 
+  public getPublicByBusiness = (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => {
+    const businessId =
+      typeof req.query.businessId === "string" &&
+      req.query.businessId.trim() !== ""
+        ? req.query.businessId.trim()
+        : "";
+
+    if (businessId === "") {
+      res.status(400).json({ message: "businessId es requerido" });
+      return;
+    }
+
+    this.businessMembershipService
+      .getAllMemberships({
+        page: 1,
+        pageSize: MAX_PAGE_SIZE,
+        businessId,
+        status: "ACTIVE",
+        expandRefs: true,
+      })
+      .then((result) => {
+        res.status(200).json(result);
+      })
+      .catch(next);
+  };
+
   public toggleStatus = (req: Request, res: Response, next: NextFunction) => {
     const id = validateMembershipIdParam(req.params.id);
-    this.businessMembershipService
-      .toggleStatus(id)
+    const execute = async () => {
+      const membership = await this.businessMembershipService.getById(id);
+      await this.requireScopedMembershipPermission(req, membership, {
+        globalPermission: "core.users.activateOrDeactivate",
+        businessPermission: "core.users.activateOrDeactivate",
+      });
+
+      return this.businessMembershipService.toggleStatus(id);
+    };
+
+    execute()
       .then((membership) => {
         res.status(200).json(membership);
       })
@@ -99,8 +258,19 @@ export class BusinessMembershipController {
 
   public toggleEmployee = (req: Request, res: Response, next: NextFunction) => {
     const id = validateMembershipIdParam(req.params.id);
-    this.businessMembershipService
-      .toggleIsEmployee(id)
+    const execute = async () => {
+      const membership = await this.businessMembershipService.getById(id);
+      await this.requireBusinessMembershipPermission(req, membership, {
+        anyOf: [
+          "core.users.changeRole",
+          "core.users.activateOrDeactivate",
+        ],
+      });
+
+      return this.businessMembershipService.toggleIsEmployee(id);
+    };
+
+    execute()
       .then((membership) => {
         res.status(200).json(membership);
       })
@@ -109,33 +279,27 @@ export class BusinessMembershipController {
 
   public assignRole = (req: Request, res: Response, next: NextFunction) => {
     const dto = validateAssignRoleDto(req.body);
-    const businessId = req.businessId;
-    if (typeof businessId !== "string" || businessId.trim() === "") {
-      next(
-        CustomError.badRequest(
-          "El header businessId es requerido y debe ser un texto no vacío"
-        )
-      );
-      return;
-    }
-    const requesterDocumentRaw = req.decodedIdToken?.["document"];
-    if (
-      typeof requesterDocumentRaw !== "string" ||
-      requesterDocumentRaw.trim() === ""
-    ) {
-      next(
-        CustomError.unauthorized(
-          "Token de sesión inválido: claim document no presente en el token."
-        )
-      );
-      return;
-    }
 
-    this.businessMembershipService
-      .assignRole(dto.membershipId, dto.roleId, {
-        businessId,
-        requesterDocument: requesterDocumentRaw.trim(),
-      })
+    const execute = async () => {
+      const targetMembership = await this.businessMembershipService.getById(
+        dto.membershipId
+      );
+      const authContext = await this.requireScopedMembershipPermission(
+        req,
+        targetMembership,
+        {
+          globalPermission: "core.users.changeRole",
+          businessPermission: "core.users.changeRole",
+        }
+      );
+
+      return this.businessMembershipService.assignRole(dto.membershipId, dto.roleId, {
+        ...(authContext.businessId !== "" && { businessId: authContext.businessId }),
+        requesterDocument: authContext.requesterDocument,
+      });
+    };
+
+    execute()
       .then((membership) => {
         res.status(200).json(membership);
       })
@@ -144,9 +308,24 @@ export class BusinessMembershipController {
 
   public assignBranch = (req: Request, res: Response, next: NextFunction) => {
     const dto = validateAssignBranchDto(req.body);
+    const execute = async () => {
+      const membership = await this.businessMembershipService.getById(
+        dto.membershipId
+      );
+      await this.requireBusinessMembershipPermission(req, membership, {
+        anyOf: [
+          "core.users.changeRole",
+          "core.users.activateOrDeactivate",
+        ],
+      });
 
-    this.businessMembershipService
-      .assignBranch(dto.membershipId, dto.branchId)
+      return this.businessMembershipService.assignBranch(
+        dto.membershipId,
+        dto.branchId
+      );
+    };
+
+    execute()
       .then((membership) => {
         res.status(200).json(membership);
       })
@@ -159,30 +338,25 @@ export class BusinessMembershipController {
     next: NextFunction
   ) => {
     try {
-      this.ensureRootUser(req, "crear membresías");
-      const dto = validateCreatePendingMembershipByDocumentDto(req.body);
+      const requesterDocument = this.getRequesterDocument(req);
+      void this.accessControlService
+        .requireGlobalPermission(
+          requesterDocument,
+          "core.memberships.create"
+        )
+        .then(() => {
+          const dto = validateCreatePendingMembershipByDocumentDto(req.body);
 
-      this.businessMembershipService
-        .createPendingByDocument(dto)
-        .then((membership) => {
-          res.status(201).json(membership);
+          this.businessMembershipService
+            .createPendingByDocument(dto)
+            .then((membership) => {
+              res.status(201).json(membership);
+            })
+            .catch(next);
         })
         .catch(next);
     } catch (error) {
       next(error);
     }
   };
-
-  private ensureRootUser(req: Request, action: string): void {
-    const email = req.decodedIdToken?.email;
-    if (!email) {
-      throw CustomError.unauthorized(
-        "Token de sesión inválido: email no presente en el token."
-      );
-    }
-
-    if (!isRootUserEmail(email)) {
-      throw CustomError.forbidden(`No tienes permisos para ${action}.`);
-    }
-  }
 }

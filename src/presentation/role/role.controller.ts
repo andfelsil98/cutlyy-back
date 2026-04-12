@@ -7,9 +7,13 @@ import {
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
 } from "../../domain/interfaces/pagination.interface";
+import { AccessControlService } from "../services/access-control.service";
 
 export class RoleController {
-  constructor(private readonly roleService: RoleService) {}
+  constructor(
+    private readonly roleService: RoleService,
+    private readonly accessControlService: AccessControlService = new AccessControlService()
+  ) {}
 
   public getAll = (req: Request, res: Response, next: NextFunction) => {
     const pageRaw =
@@ -41,9 +45,40 @@ export class RoleController {
         ? req.query.id.trim()
         : undefined;
 
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
+    const businessIdHeader = req.businessId?.trim() ?? "";
+
+    const getRoleDetail = async () => {
+      if (businessIdHeader === "") {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.roles.detail"
+        );
+      }
+
+      return this.roleService.getRoleWithPermissionsById(id!);
+    };
+
+    const getRoles = async () => {
+      if (businessIdHeader === "") {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.roles.list"
+        );
+      }
+
+      return this.roleService.getAllRoles({
+        page: pageRaw,
+        pageSize,
+        ...(businessId != null && { businessId }),
+      });
+    };
+
     if (id != null) {
-      this.roleService
-        .getRoleWithPermissionsById(id)
+      getRoleDetail()
         .then((result) => {
           res.status(200).json(result);
         })
@@ -51,12 +86,7 @@ export class RoleController {
       return;
     }
 
-    this.roleService
-      .getAllRoles({
-        page: pageRaw,
-        pageSize,
-        ...(businessId != null && { businessId }),
-      })
+    getRoles()
       .then((result) => {
         res.status(200).json(result);
       })
@@ -65,8 +95,23 @@ export class RoleController {
 
   public create = (req: Request, res: Response, next: NextFunction) => {
     const dto = validateCreateRoleDto(req.body);
-    this.roleService
-      .createRole(dto)
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
+    const businessIdHeader = req.businessId?.trim() ?? "";
+
+    const execute = async () => {
+      if (businessIdHeader === "") {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.roles.create"
+        );
+      }
+      return this.roleService.createRole(dto);
+    };
+
+    execute()
       .then((role) => {
         res.status(201).json(role);
       })
@@ -76,8 +121,23 @@ export class RoleController {
   public update = (req: Request, res: Response, next: NextFunction) => {
     const id = validateRoleIdParam(req.params.id);
     const dto = validateUpdateRoleDto(req.body);
-    this.roleService
-      .updateRole(id, dto)
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
+    const businessIdHeader = req.businessId?.trim() ?? "";
+
+    const execute = async () => {
+      if (businessIdHeader === "") {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.roles.edit"
+        );
+      }
+      return this.roleService.updateRole(id, dto);
+    };
+
+    execute()
       .then((role) => {
         res.status(200).json(role);
       })
@@ -86,12 +146,26 @@ export class RoleController {
 
   public delete = (req: Request, res: Response, next: NextFunction) => {
     const id = validateRoleIdParam(req.params.id);
-    this.roleService
-      .deleteRole(id)
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
+    const businessIdHeader = req.businessId?.trim() ?? "";
+
+    const execute = async () => {
+      if (businessIdHeader === "") {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.roles.delete"
+        );
+      }
+      return this.roleService.deleteRole(id);
+    };
+
+    execute()
       .then((result) => {
         res.status(200).json(result);
       })
       .catch(next);
   };
 }
-

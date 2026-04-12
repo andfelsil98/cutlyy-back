@@ -29,8 +29,11 @@ export class AuthService {
   ) {}
 
   async register(dto: RegisterDto): Promise<RegisterResult> {
-    const business = await this.findActiveBusinessByName(dto.businessName);
-    if (business == null) {
+    const business =
+      dto.businessName != null
+        ? await this.findActiveBusinessByName(dto.businessName)
+        : null;
+    if (dto.businessName != null && business == null) {
       throw CustomError.notFound("No existe un negocio activo con ese nombre");
     }
 
@@ -63,20 +66,16 @@ export class AuthService {
       userId = user.id;
 
       const businessMembership = await this.businessMembershipService.create({
-        businessId: business.id,
+        ...(business != null && { businessId: business.id }),
         userId: user.document,
       });
       membershipId = businessMembership.id;
 
-      await FirestoreService.createInSubcollection(
-        USERS_COLLECTION,
-        user.id,
-        "businessMemberships",
-        {
-          id: businessMembership.id,
-          businessId: business.id,
-        }
-      );
+      await FirestoreService.createInSubcollection(USERS_COLLECTION, user.id, "businessMemberships", {
+        id: businessMembership.id,
+        ...(business != null && { businessId: business.id }),
+        membershipId: businessMembership.id,
+      });
 
       return {
         user,

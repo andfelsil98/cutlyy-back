@@ -8,6 +8,7 @@ export class UsersRoutes {
     const userService = new UserService();
     const usersController = new UsersController(userService);
 
+    router.get("/public-lookup", usersController.publicLookup);
     router.get("/", usersController.getAllUsers);
     router.patch("/:id", usersController.updateUser);
     router.delete("/:document", usersController.deleteUser);

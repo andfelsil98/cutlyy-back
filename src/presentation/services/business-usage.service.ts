@@ -488,12 +488,12 @@ export class BusinessUsageService {
         countQuery: db
           .collection(ROLE_COLLECTION)
           .where("businessId", "==", input.businessId)
-          .where("type", "==", "CUSTOM"),
+          .where("type", "==", "BUSINESS"),
         fallbackQuery: db
           .collection(ROLE_COLLECTION)
           .where("businessId", "==", input.businessId)
           .select("type"),
-        predicate: (data) => data.type === "CUSTOM",
+        predicate: (data) => data.type === "BUSINESS",
       }),
     ]);
 

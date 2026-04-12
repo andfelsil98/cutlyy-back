@@ -1,20 +1,18 @@
 import { CustomError } from "../../../domain/errors/custom-error";
+import {
+  ROLE_TYPES,
+  isRoleType,
+  type RoleType,
+} from "../../../domain/constants/access-control.constants";
 import { formatName } from "../../../domain/utils/string.utils";
-
-export const ROLE_TYPES = ["GLOBAL", "CUSTOM"] as const;
-export type RoleType = (typeof ROLE_TYPES)[number];
 
 export interface CreateRoleDto {
   name: string;
   type: RoleType;
-  /** Requerido solo cuando type es CUSTOM. */
+  /** Requerido solo cuando type es BUSINESS. */
   businessId?: string;
-  /** Arreglo de ids de permisos GLOBAL a asociar al rol. */
+  /** Arreglo de ids de permisos a asociar al rol. */
   permissions: string[];
-}
-
-export function isRoleType(value: unknown): value is RoleType {
-  return typeof value === "string" && ROLE_TYPES.includes(value as RoleType);
 }
 
 export function validateCreateRoleDto(body: unknown): CreateRoleDto {
@@ -40,17 +38,16 @@ export function validateCreateRoleDto(body: unknown): CreateRoleDto {
 
   const businessIdRaw = (b as Record<string, unknown>).businessId;
   let businessId: string | undefined;
-  if (type === "GLOBAL") {
+  if (type !== "BUSINESS") {
     if (typeof businessIdRaw === "string" && businessIdRaw.trim() !== "") {
       throw CustomError.badRequest(
-        "businessId no debe enviarse cuando type es GLOBAL"
+        "businessId no debe enviarse cuando type es CROSS_BUSINESS o GLOBAL"
       );
     }
   } else {
-    // CUSTOM
     if (typeof businessIdRaw !== "string" || businessIdRaw.trim() === "") {
       throw CustomError.badRequest(
-        "businessId es requerido y debe ser un texto no vacío cuando type es CUSTOM"
+        "businessId es requerido y debe ser un texto no vacío cuando type es BUSINESS"
       );
     }
     businessId = businessIdRaw.trim();
@@ -80,4 +77,3 @@ export function validateCreateRoleDto(body: unknown): CreateRoleDto {
     permissions,
   };
 }
-

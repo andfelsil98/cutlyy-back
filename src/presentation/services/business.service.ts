@@ -1,4 +1,8 @@
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
+import {
+  DEFAULT_CROSS_BUSINESS_ADMIN_ROLE_NAME,
+  type AccessEntityType,
+} from "../../domain/constants/access-control.constants";
 import { CustomError } from "../../domain/errors/custom-error";
 import type {
   Business,
@@ -6,6 +10,8 @@ import type {
 } from "../../domain/interfaces/business.interface";
 import type { BusinessMembership } from "../../domain/interfaces/business-membership.interface";
 import type { Branch } from "../../domain/interfaces/branch.interface";
+import type { Permission } from "../../domain/interfaces/permission.interface";
+import type { Role } from "../../domain/interfaces/role.interface";
 import type { Service } from "../../domain/interfaces/service.interface";
 import type { User } from "../../domain/interfaces/user.interface";
 import type { Usage } from "../../domain/interfaces/usage.interface";
@@ -39,8 +45,7 @@ const USERS_COLLECTION = "Users";
 const USER_BUSINESS_MEMBERSHIPS_SUBCOLLECTION = "businessMemberships";
 const ROLE_PERMISSIONS_SUBCOLLECTION = "Permissions";
 const USAGE_SUBCOLLECTION = "usage";
-const ROOT_OWNER_ROLE_ID = "kr3ECTOcAGHnsbvDAr4y";
-const ROOT_SUPER_ADMIN_ID = "WyeIL50oCUFg9PBvB9m9";
+const PERMISSIONS_COLLECTION = "Permissions";
 
 function toNameKey(value: string): string {
   return value.trim().toLowerCase();
@@ -241,25 +246,7 @@ export class BusinessService {
 
       await this.ensureCreatorMembership(business.id, opts.creatorDocument);
 
-      const requestedServices = dto.services ?? [];
-      let services: Service[] = [];
-      if (requestedServices.length > 0 && this.serviceService) {
-        services = await this.serviceService.createServices({
-          businessId: business.id,
-          services: requestedServices,
-        });
-      }
-
-      const requestedBranches = dto.branches ?? [];
-      let branches: Branch[] = [];
-      if (requestedBranches.length > 0 && this.branchService) {
-        branches = await this.branchService.createBranches({
-          businessId: business.id,
-          branches: requestedBranches,
-        });
-      }
-
-      return { business, services, branches };
+      return { business, services: [], branches: [] };
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -465,6 +452,8 @@ export class BusinessService {
       );
     }
 
+    const defaultCrossBusinessRoleId =
+      await this.resolveDefaultCrossBusinessAdminRoleId();
     const memberships = await FirestoreService.getAll<BusinessMembership>(
       BUSINESS_MEMBERSHIPS_COLLECTION,
       [{ field: "businessId", operator: "==", value: businessId }]
@@ -481,7 +470,7 @@ export class BusinessService {
       membershipId = existingMembership.id;
       await FirestoreService.update(BUSINESS_MEMBERSHIPS_COLLECTION, membershipId, {
         userId: creatorUser.document,
-        roleId: ROOT_SUPER_ADMIN_ID,
+        roleId: defaultCrossBusinessRoleId,
         status: "ACTIVE" as const,
         deletedAt: null,
         updatedAt: now,
@@ -493,7 +482,7 @@ export class BusinessService {
           businessId,
           userId: creatorUser.document,
           isEmployee: false,
-          roleId: ROOT_SUPER_ADMIN_ID,
+          roleId: defaultCrossBusinessRoleId,
           status: "ACTIVE" as const,
           createdAt: now,
         }
@@ -507,9 +496,59 @@ export class BusinessService {
       "businessMemberships",
       {
         id: membershipId,
+        membershipId,
         businessId,
       }
     );
+  }
+
+  private async resolveDefaultCrossBusinessAdminRoleId(): Promise<string> {
+    const existingRoles = await FirestoreService.getAll<Role>(ROLES_COLLECTION, [
+      { field: "type", operator: "==", value: "CROSS_BUSINESS" },
+    ]);
+
+    const existingRole =
+      existingRoles.find(
+        (role) =>
+          toNameKey(role.name) === toNameKey(DEFAULT_CROSS_BUSINESS_ADMIN_ROLE_NAME)
+      ) ?? existingRoles[0] ?? null;
+    if (existingRole) {
+      return existingRole.id;
+    }
+
+    const permissions = await FirestoreService.getAll<Permission>(
+      PERMISSIONS_COLLECTION
+    );
+    const compatiblePermissions = permissions.filter(
+      (permission) =>
+        permission.type === "BUSINESS" || permission.type === "HYBRID"
+    );
+
+    const createdRole = await FirestoreService.create(ROLES_COLLECTION, {
+      name: DEFAULT_CROSS_BUSINESS_ADMIN_ROLE_NAME,
+      type: "CROSS_BUSINESS" as const,
+      permissionsCount: compatiblePermissions.length,
+      createdAt: FirestoreDataBase.generateTimeStamp(),
+    });
+
+    await Promise.all(
+      compatiblePermissions.map((permission) =>
+        FirestoreService.createInSubcollection(
+          ROLES_COLLECTION,
+          createdRole.id,
+          ROLE_PERMISSIONS_SUBCOLLECTION,
+          {
+            id: permission.id,
+            name: permission.name,
+            value: permission.value,
+            moduleId: permission.moduleId,
+            type: permission.type as AccessEntityType,
+          }
+        )
+      )
+    );
+
+    return createdRole.id;
   }
 
   private async markMembershipsAsInactiveByBusiness(
@@ -580,7 +619,7 @@ export class BusinessService {
         { field: "businessId", operator: "==", value: businessId },
       ]),
       FirestoreService.getAll<FirestoreEntityWithId>(ROLES_COLLECTION, [
-        { field: "type", operator: "==", value: "CUSTOM" },
+        { field: "type", operator: "==", value: "BUSINESS" },
         { field: "businessId", operator: "==", value: businessId },
       ]),
       FirestoreService.getAll<FirestoreEntityWithId>(SERVICES_COLLECTION, [

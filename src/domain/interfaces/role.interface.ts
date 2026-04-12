@@ -1,11 +1,12 @@
+import type { RoleType } from "../constants/access-control.constants";
+
 export interface Role {
   id: string;
   businessId?: string;
   name: string;
-  type: "GLOBAL" | "CUSTOM";
+  type: RoleType;
   permissionsCount: number;
   createdAt: string;
   updatedAt?: string;
   deletedAt?: string;
 }
-

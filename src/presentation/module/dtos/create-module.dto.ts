@@ -1,5 +1,10 @@
 import { CustomError } from "../../../domain/errors/custom-error";
 import {
+  ACCESS_ENTITY_TYPES,
+  isAccessEntityType,
+  type AccessEntityType,
+} from "../../../domain/constants/access-control.constants";
+import {
   formatName,
   normalizeSpaces,
 } from "../../../domain/utils/string.utils";
@@ -7,6 +12,7 @@ import {
 export interface CreateModuleDto {
   name: string;
   value: string;
+  type: AccessEntityType;
   description?: string;
 }
 
@@ -29,6 +35,14 @@ export function validateCreateModuleDto(body: unknown): CreateModuleDto {
   }
   const value = normalizeSpaces(valueRaw);
 
+  const typeRaw = b.type;
+  if (!isAccessEntityType(typeRaw)) {
+    throw CustomError.badRequest(
+      `type debe ser uno de: ${ACCESS_ENTITY_TYPES.join(", ")}`
+    );
+  }
+  const type = typeRaw;
+
   const descriptionRaw = b.description;
   let description: string | undefined;
   if (descriptionRaw !== undefined) {
@@ -46,6 +60,7 @@ export function validateCreateModuleDto(body: unknown): CreateModuleDto {
   return {
     name,
     value,
+    type,
     ...(description !== undefined && { description }),
   };
 }

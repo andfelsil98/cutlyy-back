@@ -18,6 +18,7 @@ export class BusinessMembershipRoutes {
       businessMembershipService
     );
 
+    router.get("/public", businessMembershipController.getPublicByBusiness);
     router.get("/", businessMembershipController.getAll);
     router.post(
       "/create-by-document",

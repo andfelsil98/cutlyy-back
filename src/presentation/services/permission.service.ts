@@ -1,4 +1,5 @@
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
+import { isAccessEntityType } from "../../domain/constants/access-control.constants";
 import { CustomError } from "../../domain/errors/custom-error";
 import type { DbFilters } from "../../domain/interfaces/dbFilters.interface";
 import type { Permission } from "../../domain/interfaces/permission.interface";
@@ -28,12 +29,38 @@ function buildModuleFilters(moduleId?: string): DbFilters[] {
   return [{ field: "moduleId", operator: "==" as const, value: moduleId }];
 }
 
+function buildTypeFilters(types: string[]): DbFilters[] {
+  if (types.length === 0) return [];
+  if (types.length === 1) {
+    return [{ field: "type", operator: "==" as const, value: types[0]! }];
+  }
+
+  return [{ field: "type", operator: "in" as const, value: types }];
+}
+
+function normalizeRequestedTypes(type?: string, types?: string[]): string[] {
+  const rawValues = [
+    ...(typeof type === "string" ? [type] : []),
+    ...(Array.isArray(types) ? types : []),
+  ];
+
+  return Array.from(
+    new Set(
+      rawValues
+        .map((value) => value.trim().toUpperCase())
+        .filter((value) => value !== "" && isAccessEntityType(value))
+    )
+  );
+}
+
 export class PermissionService {
   async getAllPermissions(
     params: PaginationParams & {
       moduleId?: string;
       id?: string;
       ids?: string[];
+      type?: string;
+      types?: string[];
     }
   ): Promise<PaginatedResult<Permission>> {
     try {
@@ -42,6 +69,7 @@ export class PermissionService {
 
       const normalizedId = params.id?.trim();
       const normalizedModuleId = params.moduleId?.trim();
+      const normalizedTypes = normalizeRequestedTypes(params.type, params.types);
       const normalizedIds = Array.from(
         new Set(
           (params.ids ?? [])
@@ -53,6 +81,7 @@ export class PermissionService {
       if (
         normalizedId == null &&
         normalizedModuleId == null &&
+        normalizedTypes.length === 0 &&
         normalizedIds.length === 0
       ) {
         return await FirestoreService.getAllPaginated<Permission>(
@@ -65,6 +94,7 @@ export class PermissionService {
       if (normalizedId != null && normalizedId !== "") {
         const filters: DbFilters[] = [
           { field: "id", operator: "==" as const, value: normalizedId },
+          ...buildTypeFilters(normalizedTypes),
           ...buildModuleFilters(normalizedModuleId),
         ];
         permissions = await FirestoreService.getAll<Permission>(COLLECTION_NAME, filters);
@@ -79,6 +109,7 @@ export class PermissionService {
           chunks.map((chunk) => {
             const filters: DbFilters[] = [
               { field: "id", operator: "in" as const, value: chunk },
+              ...buildTypeFilters(normalizedTypes),
               ...buildModuleFilters(normalizedModuleId),
             ];
             return FirestoreService.getAll<Permission>(COLLECTION_NAME, filters);
@@ -91,7 +122,10 @@ export class PermissionService {
         });
         permissions = Array.from(uniquePermissions.values());
       } else {
-        const filters = buildModuleFilters(normalizedModuleId);
+        const filters: DbFilters[] = [
+          ...buildTypeFilters(normalizedTypes),
+          ...buildModuleFilters(normalizedModuleId),
+        ];
         permissions = await FirestoreService.getAll<Permission>(COLLECTION_NAME, filters);
       }
 
@@ -132,10 +166,17 @@ export class PermissionService {
         [{ field: "id", operator: "==", value: dto.moduleId }]
       );
       if (modules.length === 0) throw CustomError.notFound("No existe un módulo con este id");
+      const module = modules[0]!;
+      if (module.type !== dto.type) {
+        throw CustomError.badRequest(
+          "El type del permiso debe coincidir con el type del módulo asociado"
+        );
+      }
 
       const data = {
         name: dto.name,
         value: dto.value,
+        type: dto.type,
         ...(dto.description !== undefined && { description: dto.description }),
         moduleId: dto.moduleId,
         createdAt: FirestoreDataBase.generateTimeStamp(),

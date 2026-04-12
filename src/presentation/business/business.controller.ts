@@ -3,12 +3,15 @@ import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "../../domain/int
 import { validateCreateBusinessCompleteDto } from "./dtos/create-business-complete.dto";
 import { validateUpdateBusinessDto } from "./dtos/update-business.dto";
 import type { BusinessService } from "../services/business.service";
-import { isRootUserEmail } from "../../config/root-user-emails.config";
 import { CustomError } from "../../domain/errors/custom-error";
 import { normalizeConsecutivePrefix } from "../../domain/utils/booking-consecutive.utils";
+import { AccessControlService } from "../services/access-control.service";
 
 export class BusinessController {
-  constructor(private readonly businessService: BusinessService) {}
+  constructor(
+    private readonly businessService: BusinessService,
+    private readonly accessControlService: AccessControlService = new AccessControlService()
+  ) {}
 
   public getAll = (req: Request, res: Response, next: NextFunction) => {
     const pageRaw = req.query.page != null ? Number(req.query.page) : DEFAULT_PAGE;
@@ -50,17 +53,6 @@ export class BusinessController {
   };
 
   public create = (req: Request, res: Response, next: NextFunction) => {
-    const email = req.decodedIdToken?.email;
-    if (!email) {
-      next(CustomError.unauthorized("Token de sesión inválido: email no presente en el token."));
-      return;
-    }
-
-    if (!isRootUserEmail(email)) {
-      next(CustomError.forbidden("No tienes permisos para crear negocios."));
-      return;
-    }
-
     const documentClaimRaw = req.decodedIdToken?.["document"];
     if (typeof documentClaimRaw !== "string" || documentClaimRaw.trim() === "") {
       next(
@@ -73,8 +65,11 @@ export class BusinessController {
     const creatorDocument = documentClaimRaw.trim();
 
     const dto = validateCreateBusinessCompleteDto(req.body);
-    this.businessService
-      .createBusinessComplete(dto, { creatorDocument })
+    this.accessControlService
+      .requireGlobalPermission(creatorDocument, "core.bussinesses.create")
+      .then(() =>
+        this.businessService.createBusinessComplete(dto, { creatorDocument })
+      )
       .then((result) => {
         res.status(201).json(result);
       })
@@ -87,9 +82,19 @@ export class BusinessController {
       res.status(400).json({ message: "El id del negocio es requerido" });
       return;
     }
+    const documentClaimRaw = req.decodedIdToken?.["document"];
+    if (typeof documentClaimRaw !== "string" || documentClaimRaw.trim() === "") {
+      next(
+        CustomError.unauthorized(
+          "Token de sesión inválido: claim document no presente en el token."
+        )
+      );
+      return;
+    }
     const dto = validateUpdateBusinessDto(req.body);
-    this.businessService
-      .updateBusiness(id, dto)
+    this.accessControlService
+      .requireGlobalPermission(documentClaimRaw.trim(), "core.bussinesses.edit")
+      .then(() => this.businessService.updateBusiness(id, dto))
       .then((business) => {
         res.status(200).json(business);
       })
@@ -114,8 +119,11 @@ export class BusinessController {
     }
     const actorDocument = documentClaimRaw.trim();
 
-    this.businessService
-      .deleteBusiness(id, { actorDocument })
+    this.accessControlService
+      .requireGlobalPermission(actorDocument, "core.bussinesses.delete")
+      .then(() =>
+        this.businessService.deleteBusiness(id, { actorDocument })
+      )
       .then((business) => {
         res.status(200).json(business);
       })
@@ -140,8 +148,11 @@ export class BusinessController {
     }
     const actorDocument = documentClaimRaw.trim();
 
-    this.businessService
-      .toggleBusinessStatus(id, { actorDocument })
+    this.accessControlService
+      .requireGlobalPermission(actorDocument, "core.bussinesses.edit")
+      .then(() =>
+        this.businessService.toggleBusinessStatus(id, { actorDocument })
+      )
       .then((business) => {
         res.status(200).json(business);
       })

@@ -1,5 +1,9 @@
 import { FieldValue } from "firebase-admin/firestore";
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
+import {
+  isBusinessRoleType,
+  isGlobalRoleType,
+} from "../../domain/constants/access-control.constants";
 import { CustomError } from "../../domain/errors/custom-error";
 import type { Business } from "../../domain/interfaces/business.interface";
 import type { Branch } from "../../domain/interfaces/branch.interface";
@@ -27,15 +31,15 @@ const BUSINESSES_COLLECTION = "Businesses";
 const BRANCHES_COLLECTION = "Branches";
 const ROLE_COLLECTION = "Roles";
 const USER_COLLECTION = "Users";
-const ROOT_SUPER_ADMIN_ID = "WyeIL50oCUFg9PBvB9m9";
 
 export interface CreateBusinessMembershipData {
-  businessId: string;
+  businessId?: string;
   userId: string;
 }
 
 export interface CreatePendingMembershipByDocumentData {
-  businessId: string;
+  businessId?: string;
+  businessName?: string;
   document: string;
 }
 
@@ -356,7 +360,7 @@ export class BusinessMembershipService {
   async create(data: CreateBusinessMembershipData): Promise<BusinessMembership> {
     try {
       const doc = {
-        businessId: data.businessId,
+        businessId: data.businessId?.trim() ? data.businessId.trim() : null,
         userId: data.userId,
         isEmployee: false,
         roleId: null as string | null,
@@ -375,13 +379,11 @@ export class BusinessMembershipService {
     data: CreatePendingMembershipByDocumentData
   ): Promise<BusinessMembership> {
     try {
-      const businessId = data.businessId.trim();
       const document = data.document.trim();
+      const explicitBusinessId = data.businessId?.trim() ?? "";
+      const businessName = data.businessName?.trim() ?? "";
 
-      const [user, business] = await Promise.all([
-        this.findUserByDocument(document),
-        this.getBusinessById(businessId),
-      ]);
+      const user = await this.findUserByDocument(document);
 
       if (!user) {
         throw CustomError.notFound(
@@ -389,32 +391,82 @@ export class BusinessMembershipService {
         );
       }
 
-      if (business.status === "DELETED") {
-        throw CustomError.badRequest(
-          "No se puede crear una membresía en un negocio eliminado"
+      const now = FirestoreDataBase.generateTimeStamp();
+      const businessId =
+        explicitBusinessId !== ""
+          ? explicitBusinessId
+          : businessName !== ""
+            ? (await this.getBusinessByName(businessName)).id
+            : "";
+      if (businessId !== "") {
+        const business = await this.getBusinessById(businessId);
+        if (business.status === "DELETED") {
+          throw CustomError.badRequest(
+            "No se puede crear una membresía en un negocio eliminado"
+          );
+        }
+
+        const existingMemberships = await this.getMembershipsByBusinessAndUser(
+          businessId,
+          user
         );
+        const activeMembership = existingMemberships.find(
+          (membership) => membership.status !== "DELETED"
+        );
+
+        if (activeMembership) {
+          throw CustomError.conflict(
+            "Ya existe una membresía registrada para este usuario en el negocio indicado"
+          );
+        }
+
+        const reusableMembership = existingMemberships[0] ?? null;
+        const membershipId = reusableMembership?.id;
+
+        if (membershipId) {
+          await FirestoreService.update(COLLECTION_NAME, membershipId, {
+            businessId,
+            userId: user.document,
+            isEmployee: false,
+            roleId: null,
+            status: "PENDING" as const,
+            branchId: FieldValue.delete(),
+            deletedAt: null,
+            updatedAt: now,
+          });
+        } else {
+          const createdMembership = await FirestoreService.create(COLLECTION_NAME, {
+            businessId,
+            userId: user.document,
+            isEmployee: false,
+            roleId: null as string | null,
+            status: "PENDING" as const,
+            createdAt: now,
+          });
+
+          await this.ensureUserMembershipLink(user.id, createdMembership.id, businessId);
+          return this.normalizeMembership(createdMembership as BusinessMembership);
+        }
+
+        await this.ensureUserMembershipLink(user.id, membershipId, businessId);
+        return await this.getMembershipById(membershipId);
       }
 
-      const existingMemberships = await this.getMembershipsByBusinessAndUser(
-        businessId,
-        user
-      );
-      const activeMembership = existingMemberships.find(
+      const globalMemberships = await this.getGlobalMembershipsByUser(user);
+      const activeGlobalMembership = globalMemberships.find(
         (membership) => membership.status !== "DELETED"
       );
-
-      if (activeMembership) {
+      if (activeGlobalMembership) {
         throw CustomError.conflict(
-          "Ya existe una membresía registrada para este usuario en el negocio indicado"
+          "Ya existe una membresía global registrada para este usuario"
         );
       }
 
-      const now = FirestoreDataBase.generateTimeStamp();
-      const reusableMembership = existingMemberships[0] ?? null;
-      const membershipId = reusableMembership?.id;
-
-      if (membershipId) {
-        await FirestoreService.update(COLLECTION_NAME, membershipId, {
+      const reusableGlobalMembership = globalMemberships[0] ?? null;
+      const globalMembershipId = reusableGlobalMembership?.id;
+      if (globalMembershipId) {
+        await FirestoreService.update(COLLECTION_NAME, globalMembershipId, {
+          businessId: null,
           userId: user.document,
           isEmployee: false,
           roleId: null,
@@ -423,22 +475,21 @@ export class BusinessMembershipService {
           deletedAt: null,
           updatedAt: now,
         });
-      } else {
-        const createdMembership = await FirestoreService.create(COLLECTION_NAME, {
-          businessId,
-          userId: user.document,
-          isEmployee: false,
-          roleId: null as string | null,
-          status: "PENDING" as const,
-          createdAt: now,
-        });
-
-        await this.ensureUserMembershipLink(user.id, createdMembership.id, businessId);
-        return this.normalizeMembership(createdMembership as BusinessMembership);
+        await this.ensureUserMembershipLink(user.id, globalMembershipId);
+        return await this.getMembershipById(globalMembershipId);
       }
 
-      await this.ensureUserMembershipLink(user.id, membershipId, businessId);
-      return await this.getMembershipById(membershipId);
+      const createdGlobalMembership = await FirestoreService.create(COLLECTION_NAME, {
+        businessId: null,
+        userId: user.document,
+        isEmployee: false,
+        roleId: null as string | null,
+        status: "PENDING" as const,
+        createdAt: now,
+      });
+
+      await this.ensureUserMembershipLink(user.id, createdGlobalMembership.id);
+      return this.normalizeMembership(createdGlobalMembership as BusinessMembership);
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
@@ -456,6 +507,10 @@ export class BusinessMembershipService {
       throw CustomError.notFound("No existe una membresía con este id");
     }
     return this.normalizeMembership(memberships[0]!);
+  }
+
+  async getById(id: string): Promise<BusinessMembership> {
+    return this.getMembershipById(id);
   }
 
   async toggleStatus(id: string): Promise<BusinessMembership> {
@@ -537,6 +592,12 @@ export class BusinessMembershipService {
         );
       }
 
+      if (!membership.businessId?.trim()) {
+        throw CustomError.badRequest(
+          "No se puede cambiar isEmployee en una membresía global"
+        );
+      }
+
       const business = await FirestoreService.getById<Business>(
         BUSINESSES_COLLECTION,
         membership.businessId
@@ -594,46 +655,60 @@ export class BusinessMembershipService {
     membershipId: string,
     roleId: string,
     opts: {
-      businessId: string;
+      businessId?: string;
       requesterDocument: string;
     }
   ): Promise<BusinessMembership> {
     try {
       const targetMembership = await this.getMembershipById(membershipId);
-      const businessId = opts.businessId.trim();
+      const businessId = opts.businessId?.trim() ?? "";
       const requesterDocument = opts.requesterDocument.trim();
 
-      if (targetMembership.businessId !== businessId) {
-        throw CustomError.badRequest(
-          "El businessId del header no coincide con la membresía a modificar"
-        );
+      const targetBusinessId = targetMembership.businessId?.trim() ?? "";
+      if (targetBusinessId !== "") {
+        if (targetBusinessId !== businessId) {
+          throw CustomError.badRequest(
+            "El businessId del header no coincide con la membresía a modificar"
+          );
+        }
+
+        const requesterMembership =
+          await this.getMembershipByBusinessAndRequesterDocument(
+            businessId,
+            requesterDocument
+          );
+        if (!requesterMembership || requesterMembership.status === "DELETED") {
+          throw CustomError.forbidden(
+            "No tienes membresía vigente en el negocio indicado para asignar roles"
+          );
+        }
       }
 
-      const requesterMembership =
-        await this.getMembershipByBusinessAndRequesterDocument(
-          businessId,
-          requesterDocument
-        );
-      if (!requesterMembership || requesterMembership.status === "DELETED") {
-        throw CustomError.forbidden(
-          "No tienes membresía vigente en el negocio indicado para asignar roles"
-        );
-      }
-
-      // Validar rol
       const roles = await FirestoreService.getAll<Role>(ROLE_COLLECTION, [
         { field: "id", operator: "==", value: roleId },
       ]);
       if (roles.length === 0) {
         throw CustomError.notFound("No existe un rol con este id");
       }
+      const role = roles[0]!;
 
-      const isDemotingSuperAdmin =
-        targetMembership.roleId === ROOT_SUPER_ADMIN_ID &&
-        roleId !== ROOT_SUPER_ADMIN_ID;
-
-      if (isDemotingSuperAdmin) {
-        await this.ensureAnotherSuperAdminExists(businessId, targetMembership.id);
+      if (targetBusinessId === "") {
+        if (!isGlobalRoleType(role.type)) {
+          throw CustomError.badRequest(
+            "Solo se puede asignar un rol GLOBAL a una membresía global"
+          );
+        }
+      } else {
+        if (!isBusinessRoleType(role.type)) {
+          throw CustomError.badRequest(
+            "Solo se puede asignar un rol BUSINESS o CROSS_BUSINESS a una membresía de negocio"
+          );
+        }
+        if (role.type === "BUSINESS" && role.businessId?.trim() !== targetBusinessId) {
+          throw CustomError.badRequest(
+            "No se puede asignar un rol BUSINESS de otro negocio"
+          );
+        }
       }
 
       const payload = {
@@ -658,6 +733,12 @@ export class BusinessMembershipService {
       if (membership.status !== "ACTIVE") {
         throw CustomError.badRequest(
           "Solo se puede asignar sede a una membresía ACTIVE"
+        );
+      }
+
+      if (!membership.businessId?.trim()) {
+        throw CustomError.badRequest(
+          "No se puede asignar sede a una membresía global"
         );
       }
 
@@ -720,31 +801,16 @@ export class BusinessMembershipService {
     );
   }
 
-  private async ensureAnotherSuperAdminExists(
-    businessId: string,
-    excludedMembershipId: string
-  ): Promise<void> {
-    const memberships = await FirestoreService.getAll<BusinessMembership>(
-      COLLECTION_NAME,
-      [{ field: "businessId", operator: "==", value: businessId }]
-    );
-
-    const anotherSuperAdminExists = memberships.some(
-      (membership) =>
-        membership.id !== excludedMembershipId &&
-        membership.status !== "DELETED" &&
-        membership.roleId === ROOT_SUPER_ADMIN_ID
-    );
-
-    if (!anotherSuperAdminExists) {
-      throw CustomError.conflict(
-        "No se puede realizar esta acción. Cada negocio debe tener al menos un SUPER_ADMIN."
-      );
-    }
-  }
-
   private normalizeMembership(membership: BusinessMembership): BusinessMembership {
-    const { branchId: rawBranchId, ...membershipWithoutBranch } = membership;
+    const {
+      branchId: rawBranchId,
+      businessId: rawBusinessId,
+      ...membershipWithoutBranch
+    } = membership;
+    const normalizedBusinessId =
+      typeof rawBusinessId === "string" && rawBusinessId.trim() !== ""
+        ? rawBusinessId.trim()
+        : null;
     const normalizedBranchId =
       typeof rawBranchId === "string" && rawBranchId.trim() !== ""
         ? rawBranchId.trim()
@@ -753,6 +819,7 @@ export class BusinessMembershipService {
     if (membership.isEmployee === true) {
       return {
         ...membershipWithoutBranch,
+        businessId: normalizedBusinessId,
         isEmployee: true,
         branchId: normalizedBranchId,
       };
@@ -760,6 +827,7 @@ export class BusinessMembershipService {
 
     return {
       ...membershipWithoutBranch,
+      businessId: normalizedBusinessId,
       isEmployee: false,
     };
   }
@@ -841,6 +909,23 @@ export class BusinessMembershipService {
     return businesses[0]!;
   }
 
+  private async getBusinessByName(businessName: string): Promise<Business> {
+    const businesses = await FirestoreService.getAll<Business>(
+      BUSINESSES_COLLECTION,
+      [{ field: "name", operator: "==", value: businessName }]
+    );
+    const business =
+      businesses.find((item) => item.status !== "DELETED") ?? null;
+
+    if (!business) {
+      throw CustomError.notFound(
+        "No existe un negocio activo con el nombre indicado"
+      );
+    }
+
+    return business;
+  }
+
   private async findUserByDocument(document: string): Promise<User | null> {
     const normalizedDocument = document.trim();
     if (normalizedDocument === "") {
@@ -883,10 +968,33 @@ export class BusinessMembershipService {
     return Array.from(membershipsMap.values());
   }
 
+  private async getGlobalMembershipsByUser(user: User): Promise<BusinessMembership[]> {
+    const [membershipsByDocument, membershipsById] = await Promise.all([
+      FirestoreService.getAll<BusinessMembership>(COLLECTION_NAME, [
+        { field: "businessId", operator: "==", value: null },
+        { field: "userId", operator: "==", value: user.document },
+      ]),
+      FirestoreService.getAll<BusinessMembership>(COLLECTION_NAME, [
+        { field: "businessId", operator: "==", value: null },
+        { field: "userId", operator: "==", value: user.id },
+      ]),
+    ]);
+
+    const membershipsMap = new Map<string, BusinessMembership>();
+    membershipsByDocument.forEach((membership) =>
+      membershipsMap.set(membership.id, this.normalizeMembership(membership))
+    );
+    membershipsById.forEach((membership) =>
+      membershipsMap.set(membership.id, this.normalizeMembership(membership))
+    );
+
+    return Array.from(membershipsMap.values());
+  }
+
   private async ensureUserMembershipLink(
     userId: string,
     membershipId: string,
-    businessId: string
+    businessId?: string
   ): Promise<void> {
     await FirestoreService.createInSubcollection(
       USER_COLLECTION,
@@ -894,7 +1002,8 @@ export class BusinessMembershipService {
       "businessMemberships",
       {
         id: membershipId,
-        businessId,
+        membershipId,
+        ...(businessId != null && businessId.trim() !== "" && { businessId }),
       }
     );
   }

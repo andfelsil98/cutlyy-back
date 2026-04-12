@@ -6,6 +6,7 @@ import {
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
 } from "../../domain/interfaces/pagination.interface";
+import { AccessControlService } from "../services/access-control.service";
 
 function parseOptionalTextQuery(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -35,8 +36,32 @@ function parseIdsQuery(value: unknown): string[] | undefined {
   return uniqueIds;
 }
 
+function parseTypesQuery(value: unknown): string[] | undefined {
+  if (value == null) return undefined;
+
+  const rawValues = Array.isArray(value) ? value : [value];
+  const types = rawValues.flatMap((item) => {
+    if (typeof item !== "string") {
+      throw new Error("types[] debe contener solo textos");
+    }
+
+    return item
+      .split(",")
+      .map((type) => type.trim())
+      .filter((type) => type !== "");
+  });
+
+  const uniqueTypes = Array.from(new Set(types));
+  if (uniqueTypes.length === 0) return undefined;
+
+  return uniqueTypes;
+}
+
 export class PermissionController {
-  constructor(private readonly permissionService: PermissionService) {}
+  constructor(
+    private readonly permissionService: PermissionService,
+    private readonly accessControlService: AccessControlService = new AccessControlService()
+  ) {}
 
   public getAll = (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -57,16 +82,35 @@ export class PermissionController {
       const pageSize = Math.min(MAX_PAGE_SIZE, pageSizeRaw);
       const id = parseOptionalTextQuery(req.query.id);
       const moduleId = parseOptionalTextQuery(req.query.moduleId);
+      const type = parseOptionalTextQuery(req.query.type);
       const ids = parseIdsQuery(req.query["ids[]"] ?? req.query.ids);
+      const types = parseTypesQuery(req.query["types[]"] ?? req.query.types);
+      const requesterDocument =
+        typeof req.decodedIdToken?.["document"] === "string"
+          ? req.decodedIdToken["document"].trim()
+          : "";
+      const businessId = req.businessId?.trim() ?? "";
 
-      this.permissionService
-        .getAllPermissions({
+      const execute = async () => {
+        if (businessId === "") {
+          await this.accessControlService.requireGlobalPermission(
+            requesterDocument,
+            "core.permissions.list"
+          );
+        }
+
+        return this.permissionService.getAllPermissions({
           page: pageRaw,
           pageSize,
           ...(id != null && { id }),
           ...(moduleId != null && { moduleId }),
+          ...(type != null && { type }),
           ...(ids != null && { ids }),
-        })
+          ...(types != null && { types }),
+        });
+      };
+
+      execute()
         .then((result) => {
           res.status(200).json(result);
         })
@@ -79,8 +123,14 @@ export class PermissionController {
 
   public create = (req: Request, res: Response, next: NextFunction) => {
     const dto = validateCreatePermissionDto(req.body);
-    this.permissionService
-      .createPermission(dto)
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
+
+    this.accessControlService
+      .requireGlobalPermission(requesterDocument, "core.permissions.create")
+      .then(() => this.permissionService.createPermission(dto))
       .then((permission) => {
         res.status(201).json(permission);
       })
@@ -94,8 +144,14 @@ export class PermissionController {
       return;
     }
 
-    this.permissionService
-      .deletePermission(id.trim())
+    const requesterDocument =
+      typeof req.decodedIdToken?.["document"] === "string"
+        ? req.decodedIdToken["document"].trim()
+        : "";
+
+    this.accessControlService
+      .requireGlobalPermission(requesterDocument, "core.permissions.delete")
+      .then(() => this.permissionService.deletePermission(id.trim()))
       .then((result) => {
         res.status(200).json(result);
       })

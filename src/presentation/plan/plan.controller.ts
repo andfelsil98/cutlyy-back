@@ -1,5 +1,4 @@
 import type { NextFunction, Request, Response } from "express";
-import { isRootUserEmail } from "../../config/root-user-emails.config";
 import { CustomError } from "../../domain/errors/custom-error";
 import {
   DEFAULT_PAGE,
@@ -7,6 +6,7 @@ import {
   MAX_PAGE_SIZE,
 } from "../../domain/interfaces/pagination.interface";
 import type { PlanService } from "../services/plan.service";
+import { AccessControlService } from "../services/access-control.service";
 import {
   isPlanStatus,
   PLAN_STATUSES,
@@ -15,7 +15,10 @@ import {
 import { validatePlanIdParam, validateUpdatePlanDto } from "./dtos/update-plan.dto";
 
 export class PlanController {
-  constructor(private readonly planService: PlanService) {}
+  constructor(
+    private readonly planService: PlanService,
+    private readonly accessControlService: AccessControlService = new AccessControlService()
+  ) {}
 
   public getAll = (req: Request, res: Response, next: NextFunction) => {
     const pageRaw =
@@ -64,10 +67,11 @@ export class PlanController {
 
   public create = (req: Request, res: Response, next: NextFunction) => {
     try {
-      this.ensureRootUser(req, "crear planes");
+      const document = this.getRequesterDocument(req);
       const dto = validateCreatePlanDto(req.body);
-      this.planService
-        .createPlan(dto)
+      this.accessControlService
+        .requireGlobalPermission(document, "core.plan.create")
+        .then(() => this.planService.createPlan(dto))
         .then((plan) => {
           res.status(201).json(plan);
         })
@@ -79,11 +83,12 @@ export class PlanController {
 
   public update = (req: Request, res: Response, next: NextFunction) => {
     try {
-      this.ensureRootUser(req, "editar planes");
+      const document = this.getRequesterDocument(req);
       const id = validatePlanIdParam(req.params.id);
       const dto = validateUpdatePlanDto(req.body);
-      this.planService
-        .updatePlan(id, dto)
+      this.accessControlService
+        .requireGlobalPermission(document, "core.plan.edit")
+        .then(() => this.planService.updatePlan(id, dto))
         .then((plan) => {
           res.status(200).json(plan);
         })
@@ -95,10 +100,11 @@ export class PlanController {
 
   public deletePlan = (req: Request, res: Response, next: NextFunction) => {
     try {
-      this.ensureRootUser(req, "eliminar planes");
+      const document = this.getRequesterDocument(req);
       const id = validatePlanIdParam(req.params.id);
-      this.planService
-        .deletePlan(id)
+      this.accessControlService
+        .requireGlobalPermission(document, "core.plan.delete")
+        .then(() => this.planService.deletePlan(id))
         .then((result) => {
           res.status(200).json(result);
         })
@@ -108,14 +114,13 @@ export class PlanController {
     }
   };
 
-  private ensureRootUser(req: Request, action: string): void {
-    const email = req.decodedIdToken?.email;
-    if (!email) {
-      throw CustomError.unauthorized("Token de sesión inválido: email no presente en el token.");
+  private getRequesterDocument(req: Request): string {
+    const document = req.decodedIdToken?.["document"];
+    if (typeof document !== "string" || document.trim() === "") {
+      throw CustomError.unauthorized(
+        "Token de sesión inválido: claim document no presente en el token."
+      );
     }
-
-    if (!isRootUserEmail(email)) {
-      throw CustomError.forbidden(`No tienes permisos para ${action}.`);
-    }
+    return document.trim();
   }
 }
