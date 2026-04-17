@@ -2,6 +2,8 @@ import { envs } from './config/envs';
 import { FirestoreDataBase } from './data/firestore/firestore.database';
 import { AppRoutes } from './presentation/routes';
 import { Server } from './presentation/server';
+import { createOutboxProcessorService } from './presentation/outbox/outbox.factory';
+import { OutboxProcessorRunnerService } from './presentation/services/outbox-processor-runner.service';
 import fs from 'fs';
 
 
@@ -26,4 +28,15 @@ async function main() {
     routes: AppRoutes.routes
   })  
   server.start();
+
+  if (envs.OUTBOX_PROCESSOR_ENABLED) {
+    const outboxProcessorService = createOutboxProcessorService();
+    const outboxProcessorRunner = new OutboxProcessorRunnerService(
+      outboxProcessorService,
+      {
+        intervalMs: envs.OUTBOX_PROCESSOR_INTERVAL_MS,
+      }
+    );
+    outboxProcessorRunner.start();
+  }
 }

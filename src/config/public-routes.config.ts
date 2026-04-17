@@ -32,6 +32,8 @@ export const PUBLIC_ROUTE_METHOD_PATHS: Array<{
   { method: "PUT", path: "/bookings/public-manage", match: "prefix" },
   { method: "POST", path: "/whatsapp/send-message", match: "prefix" },
   { method: "POST", path: "/business/usage/reconcile-today" },
+  { method: "GET", path: "/outbox", match: "prefix" },
+  { method: "POST", path: "/outbox", match: "prefix" },
   { method: "GET", path: "/plans" },
 ];
 
@@ -49,6 +51,7 @@ export const BUSINESS_ID_HEADER_EXEMPT_METHOD_PATHS: Array<{
   { method: "PUT", path: "/business", match: "prefix" },
   { method: "PATCH", path: "/business", match: "prefix" },
   { method: "DELETE", path: "/business", match: "prefix" },
+  { method: "GET", path: "/business", match: "prefix" },
   { method: "POST", path: "/plans" },
   { method: "PUT", path: "/plans", match: "prefix" },
   { method: "DELETE", path: "/plans", match: "prefix" },

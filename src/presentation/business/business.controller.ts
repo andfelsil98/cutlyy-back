@@ -76,6 +76,32 @@ export class BusinessController {
       .catch(next);
   };
 
+  public getDeletionStatus = (req: Request, res: Response, next: NextFunction) => {
+    const id = req.params.id;
+    if (!id) {
+      res.status(400).json({ message: "El id del negocio es requerido" });
+      return;
+    }
+
+    const documentClaimRaw = req.decodedIdToken?.["document"];
+    if (typeof documentClaimRaw !== "string" || documentClaimRaw.trim() === "") {
+      next(
+        CustomError.unauthorized(
+          "Token de sesión inválido: claim document no presente en el token."
+        )
+      );
+      return;
+    }
+
+    this.accessControlService
+      .requireGlobalPermission(documentClaimRaw.trim(), "core.bussinesses.list")
+      .then(() => this.businessService.getBusinessDeletionStatus(id))
+      .then((result) => {
+        res.status(200).json(result);
+      })
+      .catch(next);
+  };
+
   public update = (req: Request, res: Response, next: NextFunction) => {
     const id = req.params.id;
     if (!id) {

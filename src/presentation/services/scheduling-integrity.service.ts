@@ -25,6 +25,15 @@ interface StoredAppointmentScheduleCandidate {
   services?: AppointmentScheduleSelectionStored[];
 }
 
+export interface AppointmentScheduleCandidateInput {
+  id: string;
+  date: string;
+  startTime: string;
+  endTime: string;
+  status: AppointmentStatus;
+  bookingId?: string;
+}
+
 interface AppointmentReference {
   appointmentId: string;
   bookingId?: string;
@@ -129,6 +138,44 @@ export class SchedulingIntegrityService {
     input: EnsureActiveAppointmentsRespectBranchScheduleInput
   ): Promise<void> {
     const conflicts = await this.listActiveAppointmentScheduleConflicts(input);
+    this.throwScheduleConflicts(input.errorMessagePrefix, conflicts);
+  }
+
+  async ensureAppointmentCandidatesRespectBranchSchedule(input: {
+    schedule: BranchScheduleDay[];
+    appointments: AppointmentScheduleCandidateInput[];
+    fallbackBookingId?: string;
+    errorMessagePrefix: string;
+  }): Promise<void> {
+    const fallbackBookingId = input.fallbackBookingId?.trim() ?? "";
+    const conflicts = input.appointments
+      .map<StoredAppointmentScheduleCandidate>((appointment) => ({
+        id: appointment.id,
+        date: appointment.date,
+        startTime: appointment.startTime,
+        endTime: appointment.endTime,
+        status: appointment.status,
+        ...(appointment.bookingId?.trim() != null && appointment.bookingId.trim() !== ""
+          ? { bookingId: appointment.bookingId.trim() }
+          : fallbackBookingId !== ""
+            ? { bookingId: fallbackBookingId }
+            : {}),
+      }))
+      .filter((appointment) =>
+        ACTIVE_APPOINTMENT_STATUSES.includes(appointment.status)
+      )
+      .map((appointment) =>
+        this.buildScheduleConflict(appointment, input.schedule)
+      )
+      .filter((conflict): conflict is AppointmentScheduleConflict => conflict != null);
+
+    this.throwScheduleConflicts(input.errorMessagePrefix, conflicts);
+  }
+
+  private throwScheduleConflicts(
+    errorMessagePrefix: string,
+    conflicts: AppointmentScheduleConflict[]
+  ): void {
     if (conflicts.length === 0) return;
 
     const summarizedConflicts = conflicts
@@ -149,7 +196,7 @@ export class SchedulingIntegrityService {
       conflicts.length > 3 ? ` y ${conflicts.length - 3} más` : "";
 
     throw CustomError.badRequest(
-      `${input.errorMessagePrefix}: ${summarizedConflicts}${remainingConflicts}`
+      `${errorMessagePrefix}: ${summarizedConflicts}${remainingConflicts}`
     );
   }
 

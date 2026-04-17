@@ -10,6 +10,7 @@ Esta carpeta es la fuente principal de documentacion del backend. El objetivo es
 - [technical/data-model.md](technical/data-model.md): colecciones Firestore, relaciones y notas de compatibilidad
 - [technical/api-surface.md](technical/api-surface.md): rutas, headers, reglas de acceso y filtros mas relevantes
 - [technical/integrations-and-operations.md](technical/integrations-and-operations.md): Firebase, Cloud Tasks, WhatsApp, push, variables de entorno y operacion
+- [technical/consistency-hardening-plan.md](technical/consistency-hardening-plan.md): diagnostico de atomicidad, matriz de decision y plan de refactor por fases
 
 ### Negocio
 

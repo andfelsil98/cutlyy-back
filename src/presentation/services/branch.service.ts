@@ -8,6 +8,7 @@ import type { PaginatedResult, PaginationParams } from "../../domain/interfaces/
 import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
 import type { CreateBranchesBodyDto } from "../branch/dtos/create-branch.dto";
 import type { UpdateBranchBodyDto } from "../branch/dtos/update-branch.dto";
+import { logger } from "../../infrastructure/logger/logger";
 import { BusinessUsageLimitService } from "./business-usage-limit.service";
 import FirestoreService from "./firestore.service";
 import { MetricService } from "./metric.service";
@@ -53,6 +54,18 @@ function areSchedulesEquivalent(
     JSON.stringify(normalizeScheduleForComparison(currentSchedule)) ===
     JSON.stringify(normalizeScheduleForComparison(nextSchedule))
   );
+}
+
+function shouldSkipStorageCleanup(error: unknown): boolean {
+  const detail =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : JSON.stringify(error);
+
+  const normalizedDetail = detail.toLowerCase();
+  return normalizedDetail.includes("bucket name not specified or invalid");
 }
 
 export class BranchService {
@@ -264,8 +277,19 @@ export class BranchService {
 
   private async deleteBranchStorageFolder(branch: Branch): Promise<void> {
     const storagePrefix = `bussinesses/${branch.businessId}/branches/${slugFromName(branch.name)}/`;
-    const bucket = FirestoreDataBase.getAdmin().storage().bucket();
-    await bucket.deleteFiles({ prefix: storagePrefix });
+    try {
+      const bucket = FirestoreDataBase.getAdmin().storage().bucket();
+      await bucket.deleteFiles({ prefix: storagePrefix });
+    } catch (error) {
+      if (shouldSkipStorageCleanup(error)) {
+        const detail = error instanceof Error ? error.message : String(error);
+        logger.warn(
+          `[BranchService] Se omite la limpieza de storage de la sede ${branch.id} porque no hay bucket configurado o válido. detalle=${detail}`
+        );
+        return;
+      }
+      throw error;
+    }
   }
 
   private async clearMembershipBranchAssignments(branchId: string): Promise<void> {

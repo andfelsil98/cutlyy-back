@@ -33,6 +33,13 @@ import { BookingConsecutiveService } from "./booking-consecutive.service";
 import type { WhatsAppService } from "./whatsapp.service";
 import { UserService } from "./user.service";
 import type { PushNotificationService } from "./push-notification.service";
+import {
+  ExternalDispatchAmbiguousError,
+  ExternalDispatchService,
+} from "./external-dispatch.service";
+import { FirestoreConsistencyService } from "./firestore-consistency.service";
+import type { FirestoreTransactionContext } from "./firestore-consistency.service";
+import { OutboxService } from "./outbox.service";
 
 const COLLECTION_NAME = "Appointments";
 const BOOKINGS_COLLECTION = "Bookings";
@@ -58,7 +65,13 @@ interface ClientData {
   email?: string;
 }
 
-interface AppointmentMetricContext {
+interface ExternalDispatchExecution {
+  channel: "WHATSAPP" | "PUSH";
+  aggregateType: string;
+  aggregateId: string;
+}
+
+export interface AppointmentMetricContext {
   businessId: string;
   branchId: string;
   employeeId: string;
@@ -102,6 +115,18 @@ interface RevenueMetricSyncDelta {
   paidCompletedAppointmentsDelta: number;
 }
 
+export interface CreateAppointmentDraftInput {
+  date: string;
+  startTime: string;
+  endTime: string;
+  serviceId: string;
+  employeeId: string;
+}
+
+export interface ValidatedCreateAppointmentDraft extends CreateAppointmentDraftInput {
+  servicePrice: number;
+}
+
 export interface CreateAppointmentForBookingData {
   bookingId: string;
   date: string;
@@ -143,6 +168,34 @@ export interface SetAppointmentStatusOptions {
   allowUnavailableBusiness?: boolean;
 }
 
+export interface PreparedBookingScopedAppointmentMutation {
+  appointmentId: string;
+  payload: Record<string, unknown> | null;
+  projectedAppointment: Appointment;
+  metricBefore: AppointmentMetricContext | null;
+  metricAfter: AppointmentMetricContext | null;
+  taskAction: "NONE" | "RESCHEDULE" | "DELETE";
+  taskReason: string;
+}
+
+interface CreateStandaloneAppointmentCoreCommitResult {
+  bookingId: string;
+  appointmentId: string;
+  createdAt: string;
+  metricsEventId: string;
+  tasksEventId: string;
+  whatsAppEventId: string;
+  pushEventId: string;
+}
+
+interface CreateExistingBookingAppointmentCoreCommitResult {
+  appointmentId: string;
+  createdAt: string;
+  paymentStatus: BookingPaymentStatus;
+  metricsEventId: string;
+  tasksEventId: string;
+}
+
 export class AppointmentService {
   private validationCache = new Map<string, unknown>();
 
@@ -156,7 +209,12 @@ export class AppointmentService {
     private readonly pushNotificationService?: PushNotificationService,
     private readonly userService: UserService = new UserService(),
     private readonly businessUsageLimitService: BusinessUsageLimitService =
-      new BusinessUsageLimitService()
+      new BusinessUsageLimitService(),
+    private readonly firestoreConsistencyService: FirestoreConsistencyService =
+      new FirestoreConsistencyService(),
+    private readonly outboxService: OutboxService = new OutboxService(),
+    private readonly externalDispatchService: ExternalDispatchService =
+      new ExternalDispatchService()
   ) {}
 
   clearValidationCache(): void {
@@ -278,10 +336,6 @@ export class AppointmentService {
   }
 
   async createAppointment(dto: CreateAppointmentDto): Promise<Appointment> {
-    let createdBookingId: string | null = null;
-    let createdAppointmentId: string | null = null;
-    let bookingQuotaConsumed = false;
-
     try {
       this.ensureAppointmentDateTimeIsNotPast(dto.date, dto.startTime);
 
@@ -315,197 +369,670 @@ export class AppointmentService {
           );
         }
 
-        const createdAppointment = await this.createAppointmentForBooking({
-          bookingId: booking.id,
-          date: dto.date,
-          startTime: dto.startTime,
-          endTime: dto.endTime,
-          serviceId: dto.serviceId,
-          employeeId: dto.employeeId,
-        });
-        createdAppointmentId = createdAppointment.id;
+        this.clearValidationCache();
+        const validatedDraftsResult =
+          await this.validateDraftAppointmentsForNewBooking({
+            businessId: booking.businessId,
+            branchId: booking.branchId,
+            appointments: [
+              {
+                date: dto.date,
+                startTime: dto.startTime,
+                endTime: dto.endTime,
+                serviceId: dto.serviceId,
+                employeeId: dto.employeeId,
+              },
+            ],
+          });
+        const validatedAppointment = validatedDraftsResult.appointments[0]!;
 
-        const nextAppointments = Array.from(
-          new Set([...(booking.appointments ?? []), createdAppointment.id])
+        const coreCommit = await this.commitAppointmentCreationForExistingBooking({
+          booking,
+          validatedAppointment,
+          beforeRevenueSnapshot,
+        });
+
+        const createdAppointment = this.buildCreatedStandaloneAppointment(
+          booking.businessId,
+          booking.id,
+          coreCommit.appointmentId,
+          coreCommit.createdAt,
+          validatedAppointment
         );
+
+        await this.runExistingBookingAppointmentPostCommitWorkflows({
+          booking,
+          appointment: createdAppointment,
+          servicePrice: validatedAppointment.servicePrice,
+          paymentStatus: coreCommit.paymentStatus,
+          beforeRevenueSnapshot,
+          metricsEventId: coreCommit.metricsEventId,
+          tasksEventId: coreCommit.tasksEventId,
+        });
+
+        return createdAppointment;
+      }
+
+      this.clearValidationCache();
+      const business = await FirestoreService.getById<Business>(
+        BUSINESS_COLLECTION,
+        dto.businessId
+      );
+      const validatedDraftsResult =
+        await this.validateDraftAppointmentsForNewBooking({
+          businessId: dto.businessId,
+          branchId: dto.branchId,
+          appointments: [
+            {
+              date: dto.date,
+              startTime: dto.startTime,
+              endTime: dto.endTime,
+              serviceId: dto.serviceId,
+              employeeId: dto.employeeId,
+            },
+          ],
+        });
+      const validatedAppointment = validatedDraftsResult.appointments[0]!;
+      const paymentStatus = this.resolveBookingPaymentStatus(
+        validatedAppointment.servicePrice,
+        0
+      );
+
+      await this.businessUsageLimitService.syncUsageStateForToday(dto.businessId);
+      const consecutive = await this.bookingConsecutiveService.generateUniqueConsecutive(
+        dto.businessId,
+        business
+      );
+
+      const coreCommit = await this.commitStandaloneAppointmentCreation({
+        dto,
+        consecutive,
+        paymentStatus,
+        validatedAppointment,
+      });
+
+      const createdAppointment = this.buildCreatedStandaloneAppointment(
+        dto.businessId,
+        coreCommit.bookingId,
+        coreCommit.appointmentId,
+        coreCommit.createdAt,
+        validatedAppointment
+      );
+
+      await this.runStandaloneAppointmentPostCommitWorkflows({
+        dto,
+        business,
+        bookingId: coreCommit.bookingId,
+        appointment: createdAppointment,
+        consecutive,
+        paymentStatus,
+        servicePrice: validatedAppointment.servicePrice,
+        metricsEventId: coreCommit.metricsEventId,
+        tasksEventId: coreCommit.tasksEventId,
+        whatsAppEventId: coreCommit.whatsAppEventId,
+        pushEventId: coreCommit.pushEventId,
+      });
+      return createdAppointment;
+    } catch (error) {
+      if (error instanceof CustomError) throw error;
+      throw CustomError.internalServerError("Error interno del servidor");
+    } finally {
+      this.clearValidationCache();
+    }
+  }
+
+  private async commitStandaloneAppointmentCreation(input: {
+    dto: CreateAppointmentDto;
+    consecutive: string;
+    paymentStatus: BookingPaymentStatus;
+    validatedAppointment: ValidatedCreateAppointmentDraft;
+  }): Promise<CreateStandaloneAppointmentCoreCommitResult> {
+    return this.firestoreConsistencyService.runTransaction(
+      "AppointmentService.createAppointment.standaloneCoreCommit",
+      async (context) => {
+        await this.ensureClientForBusinessInTransaction(
+          context,
+          input.dto.businessId,
+          {
+            document: input.dto.clientId,
+            ...(input.dto.clientDocumentTypeId !== undefined && {
+              documentTypeId: input.dto.clientDocumentTypeId,
+            }),
+            ...(input.dto.clientDocumentTypeName !== undefined && {
+              documentTypeName: input.dto.clientDocumentTypeName,
+            }),
+            ...(input.dto.clientName !== undefined && { name: input.dto.clientName }),
+            ...(input.dto.clientPhone !== undefined && { phone: input.dto.clientPhone }),
+            ...(input.dto.clientEmail !== undefined && { email: input.dto.clientEmail }),
+          }
+        );
+
+        await this.businessUsageLimitService.consumeInTransaction(
+          context,
+          input.dto.businessId,
+          "bookings",
+          1
+        );
+
+        const bookingRef = context.doc(BOOKINGS_COLLECTION);
+        const appointmentRef = context.doc(COLLECTION_NAME);
+
+        context.transaction.set(bookingRef, {
+          id: bookingRef.id,
+          businessId: input.dto.businessId,
+          branchId: input.dto.branchId,
+          consecutive: input.consecutive,
+          appointments: [appointmentRef.id],
+          clientId: input.dto.clientId,
+          status: "CREATED" as const,
+          totalAmount: input.validatedAppointment.servicePrice,
+          paymentMethod: "CASH" as const,
+          paidAmount: 0,
+          paymentStatus: input.paymentStatus,
+          createdAt: context.now,
+        });
+
+        context.transaction.set(appointmentRef, {
+          id: appointmentRef.id,
+          businessId: input.dto.businessId,
+          date: input.validatedAppointment.date,
+          startTime: input.validatedAppointment.startTime,
+          endTime: input.validatedAppointment.endTime,
+          serviceId: input.validatedAppointment.serviceId,
+          employeeId: input.validatedAppointment.employeeId,
+          status: "CREATED" as const,
+          bookingId: bookingRef.id,
+          createdAt: context.now,
+        });
+
+        const metricsEvent = this.outboxService.enqueueInTransaction(context, {
+          type: "BOOKING_METRICS_SYNC",
+          aggregateType: "BOOKING",
+          aggregateId: bookingRef.id,
+          payload: {
+            bookingId: bookingRef.id,
+            businessId: input.dto.businessId,
+            branchId: input.dto.branchId,
+            paymentStatus: input.paymentStatus,
+            beforeRevenueSnapshot: null,
+            appointments: [
+              {
+                id: appointmentRef.id,
+                date: input.validatedAppointment.date,
+                employeeId: input.validatedAppointment.employeeId,
+                servicePrice: input.validatedAppointment.servicePrice,
+              },
+            ],
+          },
+        });
+        const tasksEvent = this.outboxService.enqueueInTransaction(context, {
+          type: "APPOINTMENT_TASKS_SYNC",
+          aggregateType: "BOOKING",
+          aggregateId: bookingRef.id,
+          payload: {
+            bookingId: bookingRef.id,
+            appointments: [
+              {
+                id: appointmentRef.id,
+                date: input.validatedAppointment.date,
+                startTime: input.validatedAppointment.startTime,
+                endTime: input.validatedAppointment.endTime,
+              },
+            ],
+          },
+        });
+        const whatsAppEvent = this.outboxService.enqueueInTransaction(context, {
+          type: "BOOKING_CREATED_WHATSAPP",
+          aggregateType: "BOOKING",
+          aggregateId: bookingRef.id,
+          payload: {
+            bookingId: bookingRef.id,
+            businessId: input.dto.businessId,
+            clientDocument: input.dto.clientId,
+            bookingConsecutive: input.consecutive,
+          },
+        });
+        const pushEvent = this.outboxService.enqueueInTransaction(context, {
+          type: "BOOKING_CREATED_PUSH",
+          aggregateType: "BOOKING",
+          aggregateId: bookingRef.id,
+          payload: {
+            bookingId: bookingRef.id,
+            businessId: input.dto.businessId,
+            branchId: input.dto.branchId,
+            bookingConsecutive: input.consecutive,
+            clientDocument: input.dto.clientId,
+            appointments: [
+              {
+                id: appointmentRef.id,
+                date: input.validatedAppointment.date,
+                startTime: input.validatedAppointment.startTime,
+                employeeId: input.validatedAppointment.employeeId,
+              },
+            ],
+          },
+        });
+
+        return {
+          bookingId: bookingRef.id,
+          appointmentId: appointmentRef.id,
+          createdAt: context.now.toDate().toISOString(),
+          metricsEventId: metricsEvent.id,
+          tasksEventId: tasksEvent.id,
+          whatsAppEventId: whatsAppEvent.id,
+          pushEventId: pushEvent.id,
+        };
+      }
+    );
+  }
+
+  private buildCreatedStandaloneAppointment(
+    businessId: string,
+    bookingId: string,
+    appointmentId: string,
+    createdAt: string,
+    validatedAppointment: ValidatedCreateAppointmentDraft
+  ): Appointment {
+    return {
+      id: appointmentId,
+      businessId,
+      date: validatedAppointment.date,
+      startTime: validatedAppointment.startTime,
+      endTime: validatedAppointment.endTime,
+      serviceId: validatedAppointment.serviceId,
+      employeeId: validatedAppointment.employeeId,
+      status: "CREATED",
+      bookingId,
+      createdAt,
+    };
+  }
+
+  private async runStandaloneAppointmentPostCommitWorkflows(input: {
+    dto: CreateAppointmentDto;
+    business: Business;
+    bookingId: string;
+    appointment: Appointment;
+    consecutive: string;
+    paymentStatus: BookingPaymentStatus;
+    servicePrice: number;
+    metricsEventId: string;
+    tasksEventId: string;
+    whatsAppEventId: string;
+    pushEventId: string;
+  }): Promise<void> {
+    await this.executeTrackedOutboxStep(
+      input.metricsEventId,
+      `sincronizar métricas del booking ${input.bookingId}`,
+      async () => {
+        await this.applyCreatedAppointmentsMetrics({
+          businessId: input.dto.businessId,
+          branchId: input.dto.branchId,
+          paymentStatus: input.paymentStatus,
+          appointments: [
+            {
+              date: input.appointment.date,
+              employeeId: input.appointment.employeeId,
+              servicePrice: input.servicePrice,
+            },
+          ],
+        });
+        await this.syncBookingRevenueMetricsFromSnapshot(input.bookingId, null);
+      }
+    );
+
+    await this.executeTrackedOutboxStep(
+      input.tasksEventId,
+      `programar tasks automáticas del appointment ${input.appointment.id}`,
+      async () => {
+        await this.scheduleStatusTasksForCreatedAppointment(input.appointment);
+      }
+    );
+
+    await this.executeTrackedOutboxStep(
+      input.whatsAppEventId,
+      `enviar WhatsApp de confirmación del booking ${input.bookingId}`,
+      async () => {
+        await this.sendBookingCreatedWhatsApp(
+          input.bookingId,
+          input.dto.businessId,
+          input.consecutive,
+          input.dto.clientId,
+          { cachedBusiness: input.business }
+        );
+      },
+      {
+        externalDispatch: {
+          channel: "WHATSAPP",
+          aggregateType: "BOOKING",
+          aggregateId: input.bookingId,
+        },
+      }
+    );
+
+    await this.executeTrackedOutboxStep(
+      input.pushEventId,
+      `enviar notificación push del booking ${input.bookingId}`,
+      async () => {
+        await this.sendBookingCreatedPushNotification({
+          businessId: input.dto.businessId,
+          branchId: input.dto.branchId,
+          bookingId: input.bookingId,
+          bookingConsecutive: input.consecutive,
+          clientDocument: input.dto.clientId,
+          employeeIds: [input.appointment.employeeId],
+          appointments: [
+            {
+              id: input.appointment.id,
+              date: input.appointment.date,
+              startTime: input.appointment.startTime,
+            },
+          ],
+        });
+      },
+      {
+        externalDispatch: {
+          channel: "PUSH",
+          aggregateType: "BOOKING",
+          aggregateId: input.bookingId,
+        },
+      }
+    );
+  }
+
+  private async commitAppointmentCreationForExistingBooking(input: {
+    booking: Booking;
+    validatedAppointment: ValidatedCreateAppointmentDraft;
+    beforeRevenueSnapshot: BookingRevenueSnapshot | null;
+  }): Promise<CreateExistingBookingAppointmentCoreCommitResult> {
+    return this.firestoreConsistencyService.runTransaction(
+      "AppointmentService.createAppointment.existingBookingCoreCommit",
+      async (context) => {
+        const bookingRef = context.doc(BOOKINGS_COLLECTION, input.booking.id);
+        const appointmentRef = context.doc(COLLECTION_NAME);
+        const bookingSnapshot = await context.transaction.get(bookingRef);
+
+        if (!bookingSnapshot.exists) {
+          throw CustomError.notFound("No existe un booking con este id");
+        }
+
+        const storedBooking = bookingSnapshot.data() as Booking;
+        if (storedBooking.status !== "CREATED") {
+          throw CustomError.badRequest(
+            "Solo se pueden agregar citas a bookings con estado CREATED"
+          );
+        }
+        if (
+          storedBooking.businessId !== input.booking.businessId ||
+          storedBooking.branchId !== input.booking.branchId
+        ) {
+          throw CustomError.conflict(
+            "El booking cambió durante la operación. Intenta nuevamente"
+          );
+        }
+
         const currentTotalAmount =
-          Number.isFinite(booking.totalAmount) && booking.totalAmount >= 0
-            ? booking.totalAmount
+          Number.isFinite(storedBooking.totalAmount) && storedBooking.totalAmount >= 0
+            ? storedBooking.totalAmount
             : 0;
         const currentPaidAmount =
-          Number.isFinite(booking.paidAmount) && booking.paidAmount >= 0
-            ? booking.paidAmount
+          Number.isFinite(storedBooking.paidAmount) && storedBooking.paidAmount >= 0
+            ? storedBooking.paidAmount
             : 0;
-        const nextTotalAmount = currentTotalAmount + service.price;
+        const nextTotalAmount =
+          currentTotalAmount + input.validatedAppointment.servicePrice;
         const nextPaymentStatus = this.resolveBookingPaymentStatus(
           nextTotalAmount,
           currentPaidAmount
         );
 
-        await FirestoreService.update(BOOKINGS_COLLECTION, booking.id, {
-          appointments: nextAppointments,
+        context.transaction.set(appointmentRef, {
+          id: appointmentRef.id,
+          businessId: storedBooking.businessId,
+          date: input.validatedAppointment.date,
+          startTime: input.validatedAppointment.startTime,
+          endTime: input.validatedAppointment.endTime,
+          serviceId: input.validatedAppointment.serviceId,
+          employeeId: input.validatedAppointment.employeeId,
+          status: "CREATED" as const,
+          bookingId: storedBooking.id,
+          createdAt: context.now,
+        });
+
+        context.transaction.update(bookingRef, {
+          appointments: Array.from(
+            new Set([...(storedBooking.appointments ?? []), appointmentRef.id])
+          ),
           totalAmount: nextTotalAmount,
           paymentStatus: nextPaymentStatus,
-          updatedAt: FirestoreDataBase.generateTimeStamp(),
+          updatedAt: context.now,
         });
 
-        await this.syncBookingRevenueMetricsFromSnapshot(
-          booking.id,
-          beforeRevenueSnapshot
-        );
+        const metricsEvent = this.outboxService.enqueueInTransaction(context, {
+          type: "BOOKING_METRICS_SYNC",
+          aggregateType: "BOOKING",
+          aggregateId: storedBooking.id,
+          payload: {
+            bookingId: storedBooking.id,
+            businessId: storedBooking.businessId,
+            branchId: storedBooking.branchId,
+            paymentStatus: nextPaymentStatus,
+            beforeRevenueSnapshot: input.beforeRevenueSnapshot,
+            appointments: [
+              {
+                id: appointmentRef.id,
+                date: input.validatedAppointment.date,
+                employeeId: input.validatedAppointment.employeeId,
+                servicePrice: input.validatedAppointment.servicePrice,
+              },
+            ],
+          },
+        });
+        const tasksEvent = this.outboxService.enqueueInTransaction(context, {
+          type: "APPOINTMENT_TASKS_SYNC",
+          aggregateType: "BOOKING",
+          aggregateId: storedBooking.id,
+          payload: {
+            bookingId: storedBooking.id,
+            appointments: [
+              {
+                id: appointmentRef.id,
+                date: input.validatedAppointment.date,
+                startTime: input.validatedAppointment.startTime,
+                endTime: input.validatedAppointment.endTime,
+              },
+            ],
+          },
+        });
 
-        return createdAppointment;
+        return {
+          appointmentId: appointmentRef.id,
+          createdAt: context.now.toDate().toISOString(),
+          paymentStatus: nextPaymentStatus,
+          metricsEventId: metricsEvent.id,
+          tasksEventId: tasksEvent.id,
+        };
       }
+    );
+  }
 
-      await this.ensureClientForBusiness(dto.businessId, {
-        document: dto.clientId,
-        ...(dto.clientDocumentTypeId !== undefined && {
-          documentTypeId: dto.clientDocumentTypeId,
-        }),
-        ...(dto.clientDocumentTypeName !== undefined && {
-          documentTypeName: dto.clientDocumentTypeName,
-        }),
-        ...(dto.clientName !== undefined && { name: dto.clientName }),
-        ...(dto.clientPhone !== undefined && { phone: dto.clientPhone }),
-        ...(dto.clientEmail !== undefined && { email: dto.clientEmail }),
-      });
-      await this.businessUsageLimitService.consume(dto.businessId, "bookings", 1);
-      bookingQuotaConsumed = true;
-      const consecutive = await this.bookingConsecutiveService.generateUniqueConsecutive(
-        dto.businessId
-      );
-
-      const createdBooking = await FirestoreService.create<{
-        businessId: string;
-        branchId: string;
-        consecutive: string;
-        appointments: string[];
-        clientId: string;
-        status: "CREATED";
-        totalAmount: number;
-        paymentMethod: "CASH";
-        paidAmount: number;
-        paymentStatus: "PENDING";
-        createdAt: ReturnType<typeof FirestoreDataBase.generateTimeStamp>;
-      }>(BOOKINGS_COLLECTION, {
-        businessId: dto.businessId,
-        branchId: dto.branchId,
-        consecutive,
-        appointments: [],
-        clientId: dto.clientId,
-        status: "CREATED",
-        totalAmount: service.price,
-        paymentMethod: "CASH",
-        paidAmount: 0,
-        paymentStatus: "PENDING",
-        createdAt: FirestoreDataBase.generateTimeStamp(),
-      });
-      createdBookingId = createdBooking.id;
-
-      const createdAppointment = await this.createAppointmentForBooking({
-        bookingId: createdBooking.id,
-        date: dto.date,
-        startTime: dto.startTime,
-        endTime: dto.endTime,
-        serviceId: dto.serviceId,
-        employeeId: dto.employeeId,
-      });
-      createdAppointmentId = createdAppointment.id;
-      await FirestoreService.update(BOOKINGS_COLLECTION, createdBooking.id, {
-        appointments: [createdAppointment.id],
-        updatedAt: FirestoreDataBase.generateTimeStamp(),
-      });
-
-      await this.syncBookingRevenueMetricsFromSnapshot(createdBooking.id, null);
-
-      await this.scheduleStatusTasksForCreatedAppointment(createdAppointment).catch((taskError) => {
-        const detail =
-          taskError instanceof Error
-            ? taskError.message
-            : typeof taskError === "string"
-              ? taskError
-              : JSON.stringify(taskError);
-
-        logger.warn(
-          `[AppointmentService] No se pudieron crear tasks automáticas para appointment ${createdAppointment.id}. detalle=${detail}`
-        );
-      });
-
-      await this.sendBookingCreatedWhatsApp(
-        createdBooking.id,
-        dto.businessId,
-        consecutive,
-        dto.clientId
-      ).catch((whatsAppError) => {
-        const detail =
-          whatsAppError instanceof Error
-            ? whatsAppError.message
-            : typeof whatsAppError === "string"
-              ? whatsAppError
-              : JSON.stringify(whatsAppError);
-
-        logger.warn(
-          `[AppointmentService] No se pudo enviar WhatsApp de confirmación para booking ${createdBooking.id}. detalle=${detail}`
-        );
-      });
-
-      await this.pushNotificationService
-        ?.notifyBookingCreated({
-          businessId: dto.businessId,
-          branchId: dto.branchId,
-          bookingId: createdBooking.id,
-          bookingConsecutive: consecutive,
-          clientDocument: dto.clientId,
-          employeeIds: [createdAppointment.employeeId],
+  private async runExistingBookingAppointmentPostCommitWorkflows(input: {
+    booking: Booking;
+    appointment: Appointment;
+    servicePrice: number;
+    paymentStatus: BookingPaymentStatus;
+    beforeRevenueSnapshot: BookingRevenueSnapshot | null;
+    metricsEventId: string;
+    tasksEventId: string;
+    skipRevenueSync?: boolean;
+  }): Promise<void> {
+    await this.executeTrackedOutboxStep(
+      input.metricsEventId,
+      `sincronizar métricas del booking ${input.booking.id}`,
+      async () => {
+        await this.applyCreatedAppointmentsMetrics({
+          businessId: input.booking.businessId,
+          branchId: input.booking.branchId,
+          paymentStatus: input.paymentStatus,
           appointments: [
             {
-              id: createdAppointment.id,
-              date: createdAppointment.date,
-              startTime: createdAppointment.startTime,
+              date: input.appointment.date,
+              employeeId: input.appointment.employeeId,
+              servicePrice: input.servicePrice,
             },
           ],
-        })
-        .catch((pushNotificationError) => {
-          const detail =
-            pushNotificationError instanceof Error
-              ? pushNotificationError.message
-              : typeof pushNotificationError === "string"
-                ? pushNotificationError
-                : JSON.stringify(pushNotificationError);
+        });
+        if (input.skipRevenueSync !== true) {
+          await this.syncBookingRevenueMetricsFromSnapshot(
+            input.booking.id,
+            input.beforeRevenueSnapshot
+          );
+        }
+      }
+    );
 
+    await this.executeTrackedOutboxStep(
+      input.tasksEventId,
+      `programar tasks automáticas del appointment ${input.appointment.id}`,
+      async () => {
+        await this.scheduleStatusTasksForCreatedAppointment(input.appointment);
+      }
+    );
+  }
+
+  private async executeTrackedOutboxStep(
+    eventId: string,
+    description: string,
+    action: () => Promise<void>,
+    opts?: { externalDispatch?: ExternalDispatchExecution }
+  ): Promise<void> {
+    const claimedEvent = await this.outboxService.markProcessing(eventId).catch((error) => {
+      if (
+        error instanceof CustomError &&
+        (error.statusCode === 404 || error.statusCode === 409)
+      ) {
+        return null;
+      }
+      throw error;
+    });
+
+    if (claimedEvent == null) {
+      return;
+    }
+
+    try {
+      if (opts?.externalDispatch) {
+        await this.runExternalDispatchAction(
+          eventId,
+          description,
+          opts.externalDispatch,
+          action
+        );
+      } else {
+        await action();
+      }
+
+      await this.outboxService.markDone(eventId).catch((outboxError) => {
+        const detail =
+          outboxError instanceof Error
+            ? outboxError.message
+            : typeof outboxError === "string"
+              ? outboxError
+              : JSON.stringify(outboxError);
+        logger.warn(
+            `[AppointmentService] El side effect '${description}' se ejecutó, pero no se pudo marcar DONE el outbox ${eventId}. detalle=${detail}`
+        );
+      });
+    } catch (error) {
+      if (error instanceof ExternalDispatchAmbiguousError) {
+        logger.warn(
+          `[AppointmentService] Se pausó el outbox ${eventId} por envío externo ambiguo. detalle=${error.message}`
+        );
+        await this.outboxService.markPaused(eventId, error.message).catch((outboxError) => {
+          const outboxDetail =
+            outboxError instanceof Error
+              ? outboxError.message
+              : typeof outboxError === "string"
+                ? outboxError
+                : JSON.stringify(outboxError);
           logger.warn(
-            `[AppointmentService] No se pudo enviar notificación push para booking ${createdBooking.id}. detalle=${detail}`
+            `[AppointmentService] Además no se pudo marcar PAUSED el outbox ${eventId}. detalle=${outboxDetail}`
           );
         });
-
-      return createdAppointment;
-    } catch (error) {
-      const deletedAt = FirestoreDataBase.generateTimeStamp();
-
-      if (createdAppointmentId) {
-        await FirestoreService.update(COLLECTION_NAME, createdAppointmentId, {
-          status: "DELETED",
-          deletedAt,
-        }).catch(() => undefined);
+        return;
       }
 
-      if (createdBookingId) {
-        await FirestoreService.update(BOOKINGS_COLLECTION, createdBookingId, {
-          appointments: createdAppointmentId ? [createdAppointmentId] : [],
-          status: "DELETED",
-          deletedAt,
-          updatedAt: deletedAt,
-        }).catch(() => undefined);
-      }
-
-      if (bookingQuotaConsumed) {
-        await this.businessUsageLimitService.release(dto.businessId, "bookings", 1).catch(
-          () => undefined
+      const detail =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : JSON.stringify(error);
+      logger.warn(`[AppointmentService] No se pudo ${description}. detalle=${detail}`);
+      await this.outboxService.markError(eventId, detail).catch((outboxError) => {
+        const outboxDetail =
+          outboxError instanceof Error
+            ? outboxError.message
+            : typeof outboxError === "string"
+              ? outboxError
+              : JSON.stringify(outboxError);
+        logger.warn(
+          `[AppointmentService] Además no se pudo marcar ERROR el outbox ${eventId}. detalle=${outboxDetail}`
         );
-      }
+      });
+    }
+  }
 
-      if (error instanceof CustomError) throw error;
-      throw CustomError.internalServerError("Error interno del servidor");
+  private async runExternalDispatchAction(
+    eventId: string,
+    description: string,
+    execution: ExternalDispatchExecution,
+    action: () => Promise<void>
+  ): Promise<void> {
+    const beginResult = await this.externalDispatchService.begin({
+      dispatchId: eventId,
+      channel: execution.channel,
+      aggregateType: execution.aggregateType,
+      aggregateId: execution.aggregateId,
+      description,
+    });
+
+    if (beginResult === "ALREADY_SUCCEEDED") {
+      return;
+    }
+
+    try {
+      await action();
+    } catch (error) {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : JSON.stringify(error);
+      await this.externalDispatchService.markFailed(eventId, detail).catch(() => undefined);
+      throw error;
+    }
+
+    try {
+      await this.externalDispatchService.markSucceeded(eventId);
+    } catch (error) {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : JSON.stringify(error);
+      await this.externalDispatchService
+        .markAmbiguous(
+          eventId,
+          `El side effect '${description}' se ejecutó, pero no se pudo confirmar su persistencia. detalle=${detail}`
+        )
+        .catch(() => undefined);
+
+      throw new ExternalDispatchAmbiguousError(
+        eventId,
+        `El side effect '${description}' quedó ambiguo después de ejecutarse`
+      );
     }
   }
 
@@ -513,82 +1040,314 @@ export class AppointmentService {
     data: CreateAppointmentForBookingData
   ): Promise<Appointment> {
     try {
-      this.ensureAppointmentDateTimeIsNotPast(data.date, data.startTime);
-
       const booking = await FirestoreService.getById<Booking>(
         BOOKINGS_COLLECTION,
         data.bookingId
       );
-      const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
-      if (booking.status === "DELETED") {
+      if (booking.status !== "CREATED") {
         throw CustomError.badRequest(
-          "No se puede crear una cita para un booking eliminado"
+          "Solo se pueden agregar citas a bookings con estado CREATED"
         );
       }
 
-      const branch = await this.ensureBusinessAndBranch(
-        booking.businessId,
-        booking.branchId
-      );
-      const service = await this.ensureServiceExistsInBusiness(
-        data.serviceId,
-        booking.businessId
-      );
-      this.ensureTimeRangeWithinBranchSchedule(
-        branch,
-        data.date,
-        data.startTime,
-        data.endTime
-      );
-      await this.ensureEmployeeIsActiveInBusiness(data.employeeId, booking.businessId);
-      await this.ensureNoEmployeeScheduleConflict(
-        data.employeeId,
-        data.date,
-        data.startTime,
-        data.endTime
-      );
+      this.clearValidationCache();
+      const validatedDraftsResult =
+        await this.validateDraftAppointmentsForNewBooking({
+          businessId: booking.businessId,
+          branchId: booking.branchId,
+          appointments: [
+            {
+              date: data.date,
+              startTime: data.startTime,
+              endTime: data.endTime,
+              serviceId: data.serviceId,
+              employeeId: data.employeeId,
+            },
+          ],
+        });
+      const validatedAppointment = validatedDraftsResult.appointments[0]!;
 
-      const created = await FirestoreService.create<{
-        businessId: string;
-        date: string;
-        startTime: string;
-        endTime: string;
-        serviceId: string;
-        employeeId: string;
-        status: "CREATED";
-        bookingId: string;
-        createdAt: ReturnType<typeof FirestoreDataBase.generateTimeStamp>;
-      }>(COLLECTION_NAME, {
-        businessId: booking.businessId,
-        date: data.date,
-        startTime: data.startTime,
-        endTime: data.endTime,
-        serviceId: data.serviceId,
-        employeeId: data.employeeId,
-        status: "CREATED",
-        bookingId: data.bookingId,
-        createdAt: FirestoreDataBase.generateTimeStamp(),
+      const coreCommit = await this.commitAppointmentCreationForExistingBooking({
+        booking,
+        validatedAppointment,
+        beforeRevenueSnapshot: null,
       });
 
-      const createdAppointment = this.mapAppointmentToResponse(
-        created as unknown as AppointmentStored
+      const createdAppointment = this.buildCreatedStandaloneAppointment(
+        booking.businessId,
+        booking.id,
+        coreCommit.appointmentId,
+        coreCommit.createdAt,
+        validatedAppointment
       );
 
-      await this.applyAppointmentMetricTransition(null, {
-        businessId: booking.businessId,
-        branchId: booking.branchId,
-        employeeId: data.employeeId,
-        date: data.date,
-        status: "CREATED",
-        servicePrice: service.price,
-        paymentStatus: bookingPaymentStatus,
+      await this.runExistingBookingAppointmentPostCommitWorkflows({
+        booking,
+        appointment: createdAppointment,
+        servicePrice: validatedAppointment.servicePrice,
+        paymentStatus: coreCommit.paymentStatus,
+        beforeRevenueSnapshot: null,
+        metricsEventId: coreCommit.metricsEventId,
+        tasksEventId: coreCommit.tasksEventId,
+        skipRevenueSync: true,
       });
 
       return createdAppointment;
     } catch (error) {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
+    } finally {
+      this.clearValidationCache();
     }
+  }
+
+  async prepareUpdateAppointmentForBookingMutation(
+    id: string,
+    dto: UpdateAppointmentDto,
+    opts?: UpdateAppointmentOptions
+  ): Promise<PreparedBookingScopedAppointmentMutation> {
+    const existingAppointment = await this.getStoredAppointmentById(id);
+    const isRestoringCancelledAppointment =
+      dto.status === "CREATED" && existingAppointment.status === "CANCELLED";
+    this.ensureAppointmentDateTimeIsNotPast(dto.date, dto.startTime);
+
+    if (
+      !isRestoringCancelledAppointment &&
+      (existingAppointment.status === "IN_PROGRESS" ||
+        existingAppointment.status === "DELETED" ||
+        existingAppointment.status === "CANCELLED" ||
+        existingAppointment.status === "FINISHED")
+    ) {
+      throw CustomError.badRequest(
+        "No se puede editar una cita con estado IN_PROGRESS, FINISHED, DELETED o CANCELLED"
+      );
+    }
+
+    const bookingId = existingAppointment.bookingId?.trim() ?? "";
+    if (bookingId === "") {
+      throw CustomError.badRequest(
+        "La cita no está vinculada a un booking y no puede editarse con este flujo"
+      );
+    }
+
+    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+    if (booking.status === "DELETED") {
+      throw CustomError.badRequest("No se puede editar una cita de un booking eliminado");
+    }
+
+    const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+    const branchIdForValidation =
+      opts?.branchIdOverride != null && opts.branchIdOverride.trim() !== ""
+        ? opts.branchIdOverride.trim()
+        : booking.branchId;
+    const branch = await this.ensureBusinessAndBranch(
+      booking.businessId,
+      branchIdForValidation,
+      opts?.allowUnavailableBusiness === true
+        ? { allowUnavailableBusiness: true }
+        : undefined
+    );
+    const nextService = await this.ensureServiceExistsInBusiness(
+      dto.serviceId,
+      booking.businessId
+    );
+    this.ensureTimeRangeWithinBranchSchedule(
+      branch,
+      dto.date,
+      dto.startTime,
+      dto.endTime
+    );
+    await this.ensureEmployeeIsActiveInBusiness(dto.employeeId, booking.businessId);
+    await this.ensureNoEmployeeScheduleConflict(
+      dto.employeeId,
+      dto.date,
+      dto.startTime,
+      dto.endTime,
+      id
+    );
+
+    const previousServicePrice = await this.getServicePriceById(
+      existingAppointment.serviceId ?? dto.serviceId,
+      booking.businessId
+    );
+    const currentStatus = existingAppointment.status;
+    const mappedExistingAppointment = this.mapAppointmentToResponse(existingAppointment);
+
+    const payload: Record<string, unknown> = {
+      date: dto.date,
+      startTime: dto.startTime,
+      endTime: dto.endTime,
+      serviceId: dto.serviceId,
+      employeeId: dto.employeeId,
+      status: "CREATED",
+      services: FieldValue.delete(),
+      updatedAt: FirestoreDataBase.generateTimeStamp(),
+      cancelledAt: FieldValue.delete(),
+      deletedAt: FieldValue.delete(),
+    };
+
+    return {
+      appointmentId: id,
+      payload,
+      projectedAppointment: {
+        ...mappedExistingAppointment,
+        businessId: booking.businessId,
+        date: dto.date,
+        startTime: dto.startTime,
+        endTime: dto.endTime,
+        serviceId: dto.serviceId,
+        employeeId: dto.employeeId,
+        status: "CREATED",
+        bookingId,
+      },
+      metricBefore: {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: existingAppointment.employeeId ?? dto.employeeId,
+        date: this.normalizeStoredDate(existingAppointment.date, dto.date),
+        status: currentStatus,
+        servicePrice: previousServicePrice,
+        paymentStatus: bookingPaymentStatus,
+      },
+      metricAfter: {
+        businessId: booking.businessId,
+        branchId: branchIdForValidation,
+        employeeId: dto.employeeId,
+        date: dto.date,
+        status: "CREATED",
+        servicePrice: nextService.price,
+        paymentStatus: bookingPaymentStatus,
+      },
+      taskAction: "RESCHEDULE",
+      taskReason: "actualizar",
+    };
+  }
+
+  async prepareCancelAppointmentForBookingMutation(
+    id: string
+  ): Promise<PreparedBookingScopedAppointmentMutation> {
+    const existingAppointment = await this.getStoredAppointmentById(id);
+    const mappedExistingAppointment = this.mapAppointmentToResponse(existingAppointment);
+
+    if (existingAppointment.status === "DELETED") {
+      return {
+        appointmentId: id,
+        payload: null,
+        projectedAppointment: mappedExistingAppointment,
+        metricBefore: null,
+        metricAfter: null,
+        taskAction: "NONE",
+        taskReason: "cancelar",
+      };
+    }
+
+    if (existingAppointment.status === "FINISHED") {
+      throw CustomError.badRequest(
+        "No se puede cambiar el estado de una cita finalizada"
+      );
+    }
+
+    const bookingId = existingAppointment.bookingId?.trim() ?? "";
+    if (bookingId === "") {
+      throw CustomError.badRequest("La cita no está vinculada a un booking");
+    }
+
+    if (existingAppointment.status === "CANCELLED") {
+      return {
+        appointmentId: id,
+        payload: null,
+        projectedAppointment: mappedExistingAppointment,
+        metricBefore: null,
+        metricAfter: null,
+        taskAction: "DELETE",
+        taskReason: "cancelar",
+      };
+    }
+
+    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+    const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+    const beforeServicePrice = await this.getServicePriceById(
+      existingAppointment.serviceId ?? "",
+      booking.businessId
+    );
+
+    return {
+      appointmentId: id,
+      payload: {
+        status: "CANCELLED",
+        cancelledAt: FirestoreDataBase.generateTimeStamp(),
+        updatedAt: FirestoreDataBase.generateTimeStamp(),
+      },
+      projectedAppointment: {
+        ...mappedExistingAppointment,
+        status: "CANCELLED",
+      },
+      metricBefore: {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: existingAppointment.employeeId ?? "",
+        date: this.normalizeStoredDate(existingAppointment.date),
+        status: existingAppointment.status,
+        servicePrice: beforeServicePrice,
+        paymentStatus: bookingPaymentStatus,
+      },
+      metricAfter: {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: existingAppointment.employeeId ?? "",
+        date: this.normalizeStoredDate(existingAppointment.date),
+        status: "CANCELLED",
+        servicePrice: beforeServicePrice,
+        paymentStatus: bookingPaymentStatus,
+      },
+      taskAction: "DELETE",
+      taskReason: "cancelar",
+    };
+  }
+
+  async runPreparedBookingScopedAppointmentMutationEffects(
+    mutation: PreparedBookingScopedAppointmentMutation
+  ): Promise<void> {
+    await this.applyAppointmentMetricTransition(
+      mutation.metricBefore,
+      mutation.metricAfter
+    );
+
+    if (mutation.taskAction === "RESCHEDULE") {
+      await this.rescheduleStatusTasksForAppointment(
+        mutation.projectedAppointment,
+        mutation.taskReason
+      );
+      return;
+    }
+
+    if (mutation.taskAction === "DELETE") {
+      await this.deleteStatusTasksForAppointment(
+        mutation.appointmentId,
+        mutation.taskReason
+      );
+    }
+  }
+
+  async scheduleCreatedAppointmentTasks(appointment: Appointment): Promise<void> {
+    await this.scheduleStatusTasksForCreatedAppointment(appointment);
+  }
+
+  async prepareSetAppointmentStatusForBookingMutation(
+    id: string,
+    status: Exclude<AppointmentStatus, "IN_PROGRESS">,
+    opts?: SetAppointmentStatusOptions
+  ): Promise<PreparedBookingScopedAppointmentMutation> {
+    if (status === "CREATED") {
+      return this.prepareRestoreAppointmentToCreatedForBookingMutation(id, opts);
+    }
+    if (status === "CANCELLED") {
+      return this.prepareCancelAppointmentForBookingMutation(id);
+    }
+    if (status === "DELETED") {
+      return this.prepareDeleteAppointmentForBookingMutation(id);
+    }
+    return this.prepareFinishAppointmentForBookingMutation(id);
   }
 
   async getAppointmentById(id: string): Promise<Appointment> {
@@ -1569,6 +2328,32 @@ export class AppointmentService {
     );
   }
 
+  private async sendBookingCreatedPushNotification(input: {
+    businessId: string;
+    branchId: string;
+    bookingId: string;
+    bookingConsecutive: string;
+    clientDocument: string;
+    employeeIds: string[];
+    appointments: Array<{
+      id: string;
+      date: string;
+      startTime: string;
+    }>;
+  }): Promise<void> {
+    if (this.pushNotificationService == null) return;
+
+    await this.pushNotificationService.notifyBookingCreated({
+      businessId: input.businessId,
+      branchId: input.branchId,
+      bookingId: input.bookingId,
+      bookingConsecutive: input.bookingConsecutive,
+      clientDocument: input.clientDocument,
+      employeeIds: input.employeeIds,
+      appointments: input.appointments,
+    });
+  }
+
   private async getStoredAppointmentById(id: string): Promise<AppointmentStored> {
     const appointments = await FirestoreService.getAll<AppointmentStored>(
       COLLECTION_NAME,
@@ -1711,6 +2496,148 @@ export class AppointmentService {
 
   async ensureClientForBusiness(businessId: string, clientData: ClientData): Promise<void> {
     await this.ensureClientForAppointment(businessId, clientData);
+  }
+
+  async ensureClientForBusinessInTransaction(
+    context: FirestoreTransactionContext,
+    businessId: string,
+    clientData: ClientData
+  ): Promise<void> {
+    await this.ensureClientForAppointmentInTransaction(context, businessId, clientData);
+  }
+
+  async validateDraftAppointmentsForNewBooking(input: {
+    businessId: string;
+    branchId: string;
+    appointments: CreateAppointmentDraftInput[];
+  }): Promise<{
+    branch: Branch;
+    appointments: ValidatedCreateAppointmentDraft[];
+  }> {
+    const branch = await this.ensureBusinessAndBranch(
+      input.businessId,
+      input.branchId
+    );
+    const validatedAppointments: ValidatedCreateAppointmentDraft[] = [];
+
+    for (const appointment of input.appointments) {
+      this.ensureAppointmentDateTimeIsNotPast(
+        appointment.date,
+        appointment.startTime
+      );
+      const service = await this.ensureServiceExistsInBusiness(
+        appointment.serviceId,
+        input.businessId
+      );
+      this.ensureTimeRangeWithinBranchSchedule(
+        branch,
+        appointment.date,
+        appointment.startTime,
+        appointment.endTime
+      );
+      await this.ensureEmployeeIsActiveInBusiness(
+        appointment.employeeId,
+        input.businessId
+      );
+      await this.ensureNoEmployeeScheduleConflict(
+        appointment.employeeId,
+        appointment.date,
+        appointment.startTime,
+        appointment.endTime
+      );
+      this.ensureNoDraftEmployeeScheduleConflict(
+        validatedAppointments,
+        appointment
+      );
+
+      validatedAppointments.push({
+        ...appointment,
+        servicePrice: Math.max(0, Number(service.price ?? 0)),
+      });
+    }
+
+    return {
+      branch,
+      appointments: validatedAppointments,
+    };
+  }
+
+  async applyCreatedAppointmentsMetrics(input: {
+    businessId: string;
+    branchId: string;
+    paymentStatus: BookingPaymentStatus;
+    appointments: Array<{
+      date: string;
+      employeeId: string;
+      servicePrice: number;
+    }>;
+  }): Promise<void> {
+    for (const appointment of input.appointments) {
+      await this.applyAppointmentMetricTransition(null, {
+        businessId: input.businessId,
+        branchId: input.branchId,
+        employeeId: appointment.employeeId,
+        date: appointment.date,
+        status: "CREATED",
+        servicePrice: appointment.servicePrice,
+        paymentStatus: input.paymentStatus,
+      });
+    }
+  }
+
+  async replayBookingMetricsSyncEvent(input: {
+    bookingId: string;
+    businessId: string;
+    branchId: string;
+    paymentStatus: BookingPaymentStatus;
+    appointments: Array<{
+      id: string;
+      date: string;
+      employeeId: string;
+      servicePrice: number;
+    }>;
+    beforeRevenueSnapshot?: BookingRevenueSnapshot | null;
+  }): Promise<void> {
+    await this.applyCreatedAppointmentsMetrics({
+      businessId: input.businessId,
+      branchId: input.branchId,
+      paymentStatus: input.paymentStatus,
+      appointments: input.appointments.map((appointment) => ({
+        date: appointment.date,
+        employeeId: appointment.employeeId,
+        servicePrice: appointment.servicePrice,
+      })),
+    });
+
+    await this.syncBookingRevenueMetricsFromSnapshot(
+      input.bookingId,
+      input.beforeRevenueSnapshot ?? null
+    );
+  }
+
+  async replayAppointmentTasksSyncEvent(input: {
+    appointments: Array<{
+      id: string;
+      date: string;
+      startTime: string;
+      endTime: string;
+    }>;
+  }): Promise<void> {
+    for (const appointmentRef of input.appointments) {
+      try {
+        const appointment = await this.getAppointmentById(appointmentRef.id);
+        if (appointment.status !== "CREATED") {
+          continue;
+        }
+
+        await this.scheduleCreatedAppointmentTasks(appointment);
+      } catch (error) {
+        if (error instanceof CustomError && error.statusCode === 404) {
+          continue;
+        }
+        throw error;
+      }
+    }
   }
 
   public ensureAppointmentDateTimeIsNotPast(date: string, startTime: string): void {
@@ -1904,6 +2831,253 @@ export class AppointmentService {
         membership.isEmployee === true
     );
     return isValidEmployee;
+  }
+
+  private async prepareRestoreAppointmentToCreatedForBookingMutation(
+    id: string,
+    opts?: SetAppointmentStatusOptions
+  ): Promise<PreparedBookingScopedAppointmentMutation> {
+    const existingAppointment = await this.getStoredAppointmentById(id);
+    const mappedExistingAppointment = this.mapAppointmentToResponse(existingAppointment);
+
+    if (existingAppointment.status === "DELETED") {
+      return {
+        appointmentId: id,
+        payload: null,
+        projectedAppointment: mappedExistingAppointment,
+        metricBefore: null,
+        metricAfter: null,
+        taskAction: "NONE",
+        taskReason: "marcar en CREATED",
+      };
+    }
+    if (existingAppointment.status === "FINISHED") {
+      throw CustomError.badRequest(
+        "No se puede cambiar el estado de una cita finalizada"
+      );
+    }
+    if (existingAppointment.status === "IN_PROGRESS") {
+      throw CustomError.badRequest(
+        "No se puede cambiar el estado de una cita en curso"
+      );
+    }
+
+    const bookingId = existingAppointment.bookingId?.trim() ?? "";
+    if (bookingId === "") {
+      throw CustomError.badRequest("La cita no está vinculada a un booking");
+    }
+
+    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+    if (booking.status === "DELETED") {
+      throw CustomError.badRequest("No se puede editar una cita de un booking eliminado");
+    }
+
+    await this.ensureBusinessAndBranch(
+      booking.businessId,
+      booking.branchId,
+      opts?.allowUnavailableBusiness === true
+        ? { allowUnavailableBusiness: true }
+        : undefined
+    );
+    const service = await this.ensureServiceExistsInBusiness(
+      mappedExistingAppointment.serviceId,
+      booking.businessId
+    );
+    await this.ensureEmployeeIsActiveInBusiness(
+      mappedExistingAppointment.employeeId,
+      booking.businessId
+    );
+
+    if (existingAppointment.status === "CREATED") {
+      return {
+        appointmentId: id,
+        payload: null,
+        projectedAppointment: mappedExistingAppointment,
+        metricBefore: null,
+        metricAfter: null,
+        taskAction: "NONE",
+        taskReason: "marcar en CREATED",
+      };
+    }
+
+    const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+    return {
+      appointmentId: id,
+      payload: {
+        status: "CREATED",
+        updatedAt: FirestoreDataBase.generateTimeStamp(),
+        cancelledAt: FieldValue.delete(),
+        deletedAt: FieldValue.delete(),
+      },
+      projectedAppointment: {
+        ...mappedExistingAppointment,
+        status: "CREATED",
+      },
+      metricBefore: {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: mappedExistingAppointment.employeeId,
+        date: mappedExistingAppointment.date,
+        status: existingAppointment.status,
+        servicePrice: service.price,
+        paymentStatus: bookingPaymentStatus,
+      },
+      metricAfter: {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: mappedExistingAppointment.employeeId,
+        date: mappedExistingAppointment.date,
+        status: "CREATED",
+        servicePrice: service.price,
+        paymentStatus: bookingPaymentStatus,
+      },
+      taskAction: "RESCHEDULE",
+      taskReason: "marcar en CREATED",
+    };
+  }
+
+  private async prepareDeleteAppointmentForBookingMutation(
+    id: string
+  ): Promise<PreparedBookingScopedAppointmentMutation> {
+    const existingAppointment = await this.getStoredAppointmentById(id);
+    const mappedExistingAppointment = this.mapAppointmentToResponse(existingAppointment);
+
+    if (existingAppointment.status === "DELETED") {
+      return {
+        appointmentId: id,
+        payload: null,
+        projectedAppointment: mappedExistingAppointment,
+        metricBefore: null,
+        metricAfter: null,
+        taskAction: "NONE",
+        taskReason: "eliminar",
+      };
+    }
+
+    const bookingId = existingAppointment.bookingId?.trim() ?? "";
+    if (bookingId === "") {
+      throw CustomError.badRequest("La cita no está vinculada a un booking");
+    }
+
+    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+    const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+    const beforeServicePrice = await this.getServicePriceById(
+      existingAppointment.serviceId ?? "",
+      booking.businessId
+    );
+
+    return {
+      appointmentId: id,
+      payload: {
+        status: "DELETED",
+        deletedAt: FirestoreDataBase.generateTimeStamp(),
+      },
+      projectedAppointment: {
+        ...mappedExistingAppointment,
+        status: "DELETED",
+      },
+      metricBefore: {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: existingAppointment.employeeId ?? "",
+        date: this.normalizeStoredDate(existingAppointment.date),
+        status: existingAppointment.status,
+        servicePrice: beforeServicePrice,
+        paymentStatus: bookingPaymentStatus,
+      },
+      metricAfter: null,
+      taskAction: "DELETE",
+      taskReason: "eliminar",
+    };
+  }
+
+  private async prepareFinishAppointmentForBookingMutation(
+    id: string
+  ): Promise<PreparedBookingScopedAppointmentMutation> {
+    const existingAppointment = await this.getStoredAppointmentById(id);
+    const mappedExistingAppointment = this.mapAppointmentToResponse(existingAppointment);
+
+    if (existingAppointment.status === "DELETED") {
+      return {
+        appointmentId: id,
+        payload: null,
+        projectedAppointment: mappedExistingAppointment,
+        metricBefore: null,
+        metricAfter: null,
+        taskAction: "NONE",
+        taskReason: "marcar en FINISHED",
+      };
+    }
+    if (existingAppointment.status === "FINISHED") {
+      return {
+        appointmentId: id,
+        payload: null,
+        projectedAppointment: mappedExistingAppointment,
+        metricBefore: null,
+        metricAfter: null,
+        taskAction: "NONE",
+        taskReason: "marcar en FINISHED",
+      };
+    }
+
+    const bookingId = mappedExistingAppointment.bookingId.trim();
+    if (bookingId === "") {
+      throw CustomError.badRequest("La cita no está vinculada a un booking");
+    }
+
+    const booking = await FirestoreService.getById<Booking>(BOOKINGS_COLLECTION, bookingId);
+    const bookingPaymentStatus = this.resolveBookingPaymentStatusFromBooking(booking);
+    const servicePrice = await this.getServicePriceById(
+      mappedExistingAppointment.serviceId,
+      booking.businessId
+    ).catch((error) => {
+      if (error instanceof CustomError && error.statusCode === 404) {
+        return 0;
+      }
+      throw error;
+    });
+    const includeFinishedMetrics = await this.shouldCountAppointmentInMetrics({
+      businessId: booking.businessId,
+      branchId: booking.branchId,
+      serviceId: mappedExistingAppointment.serviceId,
+      employeeId: mappedExistingAppointment.employeeId,
+    });
+
+    return {
+      appointmentId: id,
+      payload: {
+        status: "FINISHED",
+        updatedAt: FirestoreDataBase.generateTimeStamp(),
+        cancelledAt: FieldValue.delete(),
+        deletedAt: FieldValue.delete(),
+      },
+      projectedAppointment: {
+        ...mappedExistingAppointment,
+        status: "FINISHED",
+      },
+      metricBefore: {
+        businessId: booking.businessId,
+        branchId: booking.branchId,
+        employeeId: mappedExistingAppointment.employeeId,
+        date: mappedExistingAppointment.date,
+        status: existingAppointment.status,
+        servicePrice,
+        paymentStatus: bookingPaymentStatus,
+      },
+      metricAfter: includeFinishedMetrics
+        ? {
+            businessId: booking.businessId,
+            branchId: booking.branchId,
+            employeeId: mappedExistingAppointment.employeeId,
+            date: mappedExistingAppointment.date,
+            status: "FINISHED",
+            servicePrice,
+            paymentStatus: bookingPaymentStatus,
+          }
+        : null,
+      taskAction: "DELETE",
+      taskReason: "marcar en FINISHED",
+    };
   }
 
   private async restoreAppointmentToCreated(
@@ -2175,6 +3349,33 @@ export class AppointmentService {
     }
   }
 
+  private ensureNoDraftEmployeeScheduleConflict(
+    existingAppointments: CreateAppointmentDraftInput[],
+    targetAppointment: CreateAppointmentDraftInput
+  ): void {
+    const targetStart = this.timeToMinutes(targetAppointment.startTime);
+    const targetEnd = this.timeToMinutes(targetAppointment.endTime);
+
+    const hasConflict = existingAppointments.some((appointment) => {
+      if (
+        appointment.employeeId.trim() !== targetAppointment.employeeId.trim() ||
+        appointment.date.trim() !== targetAppointment.date.trim()
+      ) {
+        return false;
+      }
+
+      const existingStart = this.timeToMinutes(appointment.startTime);
+      const existingEnd = this.timeToMinutes(appointment.endTime);
+      return targetStart < existingEnd && existingStart < targetEnd;
+    });
+
+    if (hasConflict) {
+      throw CustomError.badRequest(
+        "El empleado ya tiene otra cita en la misma solicitud para ese día y horario"
+      );
+    }
+  }
+
   private resolveAppointmentRanges(
     appointment: AppointmentStored
   ): Array<{ start: number; end: number }> {
@@ -2359,6 +3560,81 @@ export class AppointmentService {
       {
         id: membershipLinkId,
         membershipId: createdMembership.id,
+      }
+    );
+  }
+
+  private async ensureClientForAppointmentInTransaction(
+    context: FirestoreTransactionContext,
+    businessId: string,
+    clientData: ClientData
+  ): Promise<void> {
+    const clientDocument = clientData.document.trim();
+    if (clientDocument === "") {
+      throw CustomError.badRequest("clientId es requerido");
+    }
+
+    const existingUsersQuery = context.db
+      .collection(USERS_COLLECTION)
+      .where("document", "==", clientDocument)
+      .limit(1);
+    const existingUsersSnapshot = await context.transaction.get(existingUsersQuery);
+    if (!existingUsersSnapshot.empty) {
+      return;
+    }
+
+    if (
+      clientData.name == null ||
+      clientData.name.trim() === "" ||
+      clientData.phone == null ||
+      clientData.phone.trim() === "" ||
+      clientData.documentTypeId == null ||
+      clientData.documentTypeId.trim() === "" ||
+      clientData.documentTypeName == null ||
+      clientData.documentTypeName.trim() === ""
+    ) {
+      throw CustomError.badRequest(
+        "Si el cliente no existe, debes enviar clientName, clientPhone, clientDocumentTypeId y clientDocumentTypeName para crearlo"
+      );
+    }
+
+    const createdUserRef = context.doc(USERS_COLLECTION);
+    const createdMembershipRef = context.doc(BUSINESS_MEMBERSHIPS_COLLECTION);
+
+    context.transaction.set(createdUserRef, {
+      id: createdUserRef.id,
+      phone: ensureColombiaCountryCode(clientData.phone.trim()),
+      name: clientData.name.trim(),
+      email: clientData.email?.trim() ?? "",
+      isAuthActive: false,
+      document: clientDocument,
+      documentTypeName: clientData.documentTypeName.trim(),
+      documentTypeId: clientData.documentTypeId.trim(),
+      profilePhotoUrl: "",
+      createdAt: context.now,
+    });
+
+    context.transaction.set(createdMembershipRef, {
+      id: createdMembershipRef.id,
+      businessId,
+      userId: clientDocument,
+      isEmployee: false,
+      roleId: ROOT_CLIENT_ID,
+      status: "PENDING" as const,
+      createdAt: context.now,
+    });
+
+    context.transaction.set(
+      context.subdoc(
+        USERS_COLLECTION,
+        createdUserRef.id,
+        "businessMemberships",
+        createdMembershipRef.id
+      ),
+      {
+        id: createdMembershipRef.id,
+        membershipId: createdMembershipRef.id,
+        businessId,
       }
     );
   }

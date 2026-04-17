@@ -37,6 +37,7 @@ export class BusinessRoutes {
     );
 
     router.get("/", businessController.getAll);
+    router.get("/:id/deletion-status", businessController.getDeletionStatus);
     router.post("/", businessController.create);
     router.post(
       "/usage/reconcile-today",

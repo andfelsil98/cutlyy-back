@@ -1,5 +1,6 @@
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
 import { randomInt } from "node:crypto";
+import { FieldValue } from "firebase-admin/firestore";
 import {
   DEFAULT_CROSS_BUSINESS_ADMIN_ROLE_NAME,
   type AccessEntityType,
@@ -7,6 +8,9 @@ import {
 import { CustomError } from "../../domain/errors/custom-error";
 import type {
   Business,
+  BusinessDeletionState,
+  BusinessDeletionStatusResponse,
+  BusinessDeletionSummary,
   CreateBusinessCompleteResult,
 } from "../../domain/interfaces/business.interface";
 import type { BusinessMembership } from "../../domain/interfaces/business-membership.interface";
@@ -16,6 +20,7 @@ import type { Role } from "../../domain/interfaces/role.interface";
 import type { Service } from "../../domain/interfaces/service.interface";
 import type { User } from "../../domain/interfaces/user.interface";
 import type { Usage } from "../../domain/interfaces/usage.interface";
+import type { OutboxEventPayload } from "../../domain/interfaces/outbox-event.interface";
 import type { PaginatedResult, PaginationParams } from "../../domain/interfaces/pagination.interface";
 import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
 import { normalizeConsecutivePrefix } from "../../domain/utils/booking-consecutive.utils";
@@ -30,7 +35,9 @@ import type { AppointmentStatusTaskScheduler } from "./appointment-status-task-s
 import { BusinessUsageLimitService } from "./business-usage-limit.service";
 import { BusinessUsageService } from "./business-usage.service";
 import type { BranchService } from "./branch.service";
+import { FirestoreConsistencyService } from "./firestore-consistency.service";
 import FirestoreService from "./firestore.service";
+import { OutboxService } from "./outbox.service";
 import type { ServiceService } from "./service.service";
 import type { UserService } from "./user.service";
 
@@ -51,6 +58,39 @@ const USAGE_SUBCOLLECTION = "usage";
 const PERMISSIONS_COLLECTION = "Permissions";
 const BUSINESS_SLUG_SUFFIX_LENGTH = 4;
 const MAX_BUSINESS_SLUG_ATTEMPTS = 25;
+const FIRESTORE_DELETE_BATCH_SIZE = 450;
+const BUSINESS_STATUSES_THAT_BLOCK_CONSECUTIVE_PREFIX = [
+  "ACTIVE",
+  "INACTIVE",
+  "PENDING",
+] as const;
+const BUSINESS_DELETION_STAGES = [
+  "mark-business-as-deleted",
+  "load-deletion-context",
+  "delete-appointment-status-tasks",
+  "delete-business-usage",
+  "delete-reviews",
+  "delete-metrics",
+  "delete-user-business-membership-links",
+  "delete-business-memberships",
+  "delete-roles",
+  "delete-appointments",
+  "delete-bookings",
+  "delete-services",
+  "delete-branches",
+  "delete-storage-folder",
+] as const;
+const BUSINESS_DELETION_TERMINAL_STAGE = "COMPLETED" as const;
+
+type BusinessDeletionStage =
+  | (typeof BUSINESS_DELETION_STAGES)[number]
+  | typeof BUSINESS_DELETION_TERMINAL_STAGE;
+type BusinessDeletionStatus = "RUNNING" | "FAILED" | "COMPLETED";
+
+interface BusinessDeletionOutboxPayload extends OutboxEventPayload {
+  businessId: string;
+  actorDocument: string;
+}
 
 function toNameKey(value: string): string {
   return value.trim().toLowerCase();
@@ -66,6 +106,18 @@ function normalizeUniqueStrings(values: Array<string | null | undefined>): strin
         .filter((value) => value !== "")
     )
   );
+}
+
+function shouldSkipStorageCleanup(error: unknown): boolean {
+  const detail =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : JSON.stringify(error);
+
+  const normalizedDetail = detail.toLowerCase();
+  return normalizedDetail.includes("bucket name not specified or invalid");
 }
 
 interface FirestoreEntityWithId {
@@ -96,6 +148,7 @@ interface BusinessDeletionContext {
 type BusinessRecord = Omit<Business, "subscriptionStatus"> & {
   subscriptionStatus?: Business["subscriptionStatus"];
   planId?: Business["planId"];
+  deletion?: BusinessDeletionState;
 };
 
 export class BusinessService {
@@ -106,7 +159,10 @@ export class BusinessService {
     private readonly appointmentStatusTaskScheduler?: AppointmentStatusTaskScheduler,
     private readonly businessUsageService: BusinessUsageService = new BusinessUsageService(),
     private readonly businessUsageLimitService: BusinessUsageLimitService =
-      new BusinessUsageLimitService()
+      new BusinessUsageLimitService(),
+    private readonly firestoreConsistencyService: FirestoreConsistencyService =
+      new FirestoreConsistencyService(),
+    private readonly outboxService: OutboxService = new OutboxService()
   ) {}
 
   async getAllBusinesses(
@@ -175,6 +231,26 @@ export class BusinessService {
     }
   }
 
+  async getBusinessDeletionStatus(
+    id: string
+  ): Promise<BusinessDeletionStatusResponse> {
+    try {
+      const business = await FirestoreService.getById<BusinessRecord>(COLLECTION_NAME, id);
+      return {
+        businessId: business.id,
+        businessStatus: business.status,
+        deletion: business.deletion ?? null,
+      };
+    } catch (error) {
+      if (error instanceof CustomError) throw error;
+      const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+      logger.error(
+        `[BusinessService] No se pudo obtener el estado de eliminación del negocio ${id}. detalle=${detail}`
+      );
+      throw CustomError.internalServerError("Error interno del servidor");
+    }
+  }
+
   async createBusiness(dto: CreateBusinessDto): Promise<Business> {
     let createdBusinessId: string | null = null;
     let createdBusinessSlug: string | null = null;
@@ -185,6 +261,11 @@ export class BusinessService {
       const businessWithSameConsecutivePrefix = await FirestoreService.getAll<Business>(
         COLLECTION_NAME,
         [
+          {
+            field: "status",
+            operator: "in",
+            value: [...BUSINESS_STATUSES_THAT_BLOCK_CONSECUTIVE_PREFIX],
+          },
           {
             field: "consecutivePrefix",
             operator: "==",
@@ -257,6 +338,11 @@ export class BusinessService {
           COLLECTION_NAME,
           [
             {
+              field: "status",
+              operator: "in",
+              value: [...BUSINESS_STATUSES_THAT_BLOCK_CONSECUTIVE_PREFIX],
+            },
+            {
               field: "consecutivePrefix",
               operator: "==",
               value: normalizeConsecutivePrefix(dto.consecutivePrefix),
@@ -315,7 +401,7 @@ export class BusinessService {
     opts: { actorDocument: string }
   ): Promise<Business> {
     try {
-      const business = await FirestoreService.getById<Business>(COLLECTION_NAME, id);
+      const business = await FirestoreService.getById<BusinessRecord>(COLLECTION_NAME, id);
       const actorDocument = opts.actorDocument.trim();
       if (actorDocument === "") {
         throw CustomError.badRequest(
@@ -323,46 +409,374 @@ export class BusinessService {
         );
       }
 
-      const payload: Record<string, unknown> = {};
-      if (business.status !== "DELETED") {
-        payload.status = "DELETED" as const;
-      }
-      if (business.deletedAt == null) {
-        payload.deletedAt = FirestoreDataBase.generateTimeStamp();
-      }
-      if (business.deletedBy == null || business.deletedBy.trim() === "") {
-        payload.deletedBy = actorDocument;
-      }
-      if (Object.keys(payload).length > 0) {
-        await FirestoreService.update(COLLECTION_NAME, id, payload);
+      if (business.deletion?.status === "COMPLETED") {
+        return this.normalizeBusiness(business);
       }
 
-      const deletionContext = await this.loadBusinessDeletionContext(id);
-      await this.deleteAppointmentStatusTasks(deletionContext.appointmentIds);
-      await this.businessUsageService.deleteBusinessUsage(id);
-      await this.deleteDocuments(REVIEWS_COLLECTION, deletionContext.reviewIds);
-      await this.deleteDocuments(METRICS_COLLECTION, deletionContext.metricIds);
-      await this.deleteUserBusinessMembershipLinks(
-        deletionContext.users,
-        id,
-        new Set(deletionContext.membershipIds)
-      );
-      await this.deleteDocuments(
-        BUSINESS_MEMBERSHIPS_COLLECTION,
-        deletionContext.membershipIds
-      );
-      await this.deleteRoleDocuments(deletionContext.roleIds);
-      await this.deleteDocuments(APPOINTMENTS_COLLECTION, deletionContext.appointmentIds);
-      await this.deleteDocuments(BOOKINGS_COLLECTION, deletionContext.bookingIds);
-      await this.deleteDocuments(SERVICES_COLLECTION, deletionContext.serviceIds);
-      await this.deleteDocuments(BRANCHES_COLLECTION, deletionContext.branchIds);
-      await this.deleteBusinessStorageFolder(id);
+      await this.markBusinessAsDeletedForCascade(business, actorDocument);
+
+      const existingEventId = business.deletion?.eventId?.trim() ?? "";
+      let nextEventId = existingEventId;
+      if (business.deletion?.status === "FAILED" && existingEventId !== "") {
+        await this.outboxService.requeue(existingEventId).catch((error) => {
+          if (error instanceof CustomError && error.statusCode === 404) {
+            nextEventId = "";
+            return;
+          }
+          throw error;
+        });
+      }
+
+      if (nextEventId === "") {
+        const deletionEvent = await this.outboxService.enqueue<BusinessDeletionOutboxPayload>({
+          type: "BUSINESS_DELETE_CASCADE",
+          aggregateType: "BUSINESS",
+          aggregateId: id,
+          payload: {
+            businessId: id,
+            actorDocument,
+          },
+        });
+        nextEventId = deletionEvent.id;
+      }
+
+      await this.persistBusinessDeletionProgress(id, {
+        status: "RUNNING",
+        stage:
+          business.deletion?.stage != null &&
+          business.deletion.stage !== BUSINESS_DELETION_TERMINAL_STAGE
+            ? business.deletion.stage
+            : "mark-business-as-deleted",
+        summary: business.deletion?.summary ?? null,
+        clearLastError: true,
+        completed: false,
+        eventId: nextEventId,
+      });
+
       return this.normalizeBusiness(
-        await FirestoreService.getById<Business>(COLLECTION_NAME, id)
+        await FirestoreService.getById<BusinessRecord>(COLLECTION_NAME, id)
       );
     } catch (error) {
       if (error instanceof CustomError) throw error;
+      const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+      logger.error(
+        `[BusinessService] No se pudo encolar la eliminación del negocio ${id}. detalle=${detail}`
+      );
       throw CustomError.internalServerError("Error interno del servidor");
+    }
+  }
+
+  async replayBusinessDeletionCascadeEvent(
+    input: BusinessDeletionOutboxPayload
+  ): Promise<void> {
+    await this.processBusinessDeletionCascade(input.businessId, input.actorDocument);
+  }
+
+  private async processBusinessDeletionCascade(
+    id: string,
+    requestedActorDocument: string
+  ): Promise<void> {
+    let deletionStage: BusinessDeletionStage | "load-business" = "load-business";
+    let deletionContextSummary: BusinessDeletionSummary | null = null;
+    let canPersistDeletionProgress = false;
+
+    try {
+      const business = await FirestoreService.getById<BusinessRecord>(COLLECTION_NAME, id);
+      canPersistDeletionProgress = true;
+      deletionContextSummary = business.deletion?.summary ?? null;
+
+      const actorDocument = this.resolveBusinessDeletionActorDocument(
+        business,
+        requestedActorDocument
+      );
+      if (actorDocument === "") {
+        throw CustomError.badRequest(
+          "No se pudo resolver el documento del actor que elimina el negocio"
+        );
+      }
+
+      if (business.deletion?.status === "COMPLETED") {
+        return;
+      }
+
+      const deletionStartIndex = this.resolveBusinessDeletionStartIndex(business);
+      deletionStage = "load-deletion-context";
+      for (const stage of BUSINESS_DELETION_STAGES.slice(deletionStartIndex)) {
+        deletionStage = stage;
+        await this.persistBusinessDeletionProgress(id, {
+          status: "RUNNING",
+          stage,
+          summary: deletionContextSummary,
+          clearLastError: true,
+        });
+
+        switch (stage) {
+          case "mark-business-as-deleted":
+            await this.markBusinessAsDeletedForCascade(business, actorDocument);
+            break;
+
+          case "load-deletion-context": {
+            const deletionContext = await this.loadBusinessDeletionContext(id);
+            deletionContextSummary = this.buildBusinessDeletionSummary(deletionContext);
+            await this.persistBusinessDeletionProgress(id, {
+              status: "RUNNING",
+              stage,
+              summary: deletionContextSummary,
+              clearLastError: true,
+            });
+            logger.info(
+              `[BusinessService] Iniciando eliminación en cascada del negocio ${id}. actor=${actorDocument}. resumen=${JSON.stringify(
+                deletionContextSummary
+              )}`
+            );
+            break;
+          }
+
+          default: {
+            const deletionContext = await this.loadBusinessDeletionContext(id);
+            deletionContextSummary = this.buildBusinessDeletionSummary(deletionContext);
+            await this.persistBusinessDeletionProgress(id, {
+              status: "RUNNING",
+              stage,
+              summary: deletionContextSummary,
+              clearLastError: true,
+            });
+
+            await this.runBusinessDeletionStage(stage, id, deletionContext);
+            break;
+          }
+        }
+      }
+
+      deletionStage = BUSINESS_DELETION_TERMINAL_STAGE;
+      await this.persistBusinessDeletionProgress(id, {
+        status: "COMPLETED",
+        stage: BUSINESS_DELETION_TERMINAL_STAGE,
+        summary: deletionContextSummary,
+        clearLastError: true,
+        completed: true,
+      });
+
+      return;
+    } catch (error) {
+      const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+      if (canPersistDeletionProgress && deletionStage !== "load-business") {
+        await this.persistBusinessDeletionProgress(id, {
+          status: "FAILED",
+          stage: deletionStage,
+          summary: deletionContextSummary,
+          lastError: detail,
+          completed: false,
+        }).catch((persistError) => {
+          const persistDetail =
+            persistError instanceof Error
+              ? persistError.stack ?? persistError.message
+              : String(persistError);
+          logger.error(
+            `[BusinessService] No se pudo persistir el fallo de eliminación del negocio ${id}. detalle=${persistDetail}`
+          );
+        });
+      }
+
+      if (error instanceof CustomError) {
+        logger.error(
+          `[BusinessService] Falló la eliminación del negocio ${id}. stage=${deletionStage}. context=${JSON.stringify(
+            deletionContextSummary
+          )}. detalle=${detail}`
+        );
+        throw error;
+      }
+
+      logger.error(
+        `[BusinessService] Falló la eliminación del negocio ${id}. stage=${deletionStage}. context=${JSON.stringify(
+          deletionContextSummary
+        )}. detalle=${detail}`
+      );
+      throw CustomError.internalServerError("Error interno del servidor");
+    }
+  }
+
+  private async markBusinessAsDeletedForCascade(
+    business: BusinessRecord,
+    actorDocument: string
+  ): Promise<void> {
+    const payload: Record<string, unknown> = {};
+    if (business.status !== "DELETED") {
+      payload.status = "DELETED" as const;
+      payload.updatedAt = FirestoreDataBase.generateTimeStamp();
+    }
+    if (business.deletedAt == null) {
+      payload.deletedAt = FirestoreDataBase.generateTimeStamp();
+    }
+    if (business.deletedBy == null || business.deletedBy.trim() === "") {
+      payload.deletedBy = actorDocument;
+    }
+
+    if (Object.keys(payload).length === 0) {
+      return;
+    }
+
+    await FirestoreService.update(COLLECTION_NAME, business.id, payload);
+  }
+
+  private buildBusinessDeletionSummary(
+    deletionContext: BusinessDeletionContext
+  ): BusinessDeletionSummary {
+    return {
+      appointments: deletionContext.appointmentIds.length,
+      bookings: deletionContext.bookingIds.length,
+      branches: deletionContext.branchIds.length,
+      memberships: deletionContext.membershipIds.length,
+      metrics: deletionContext.metricIds.length,
+      reviews: deletionContext.reviewIds.length,
+      roles: deletionContext.roleIds.length,
+      services: deletionContext.serviceIds.length,
+      users: deletionContext.users.length,
+    };
+  }
+
+  private resolveBusinessDeletionActorDocument(
+    business: BusinessRecord,
+    requestedActorDocument: string
+  ): string {
+    const normalizedRequestedActorDocument = requestedActorDocument.trim();
+    if (normalizedRequestedActorDocument !== "") {
+      return normalizedRequestedActorDocument;
+    }
+
+    return business.deletedBy?.trim() ?? "";
+  }
+
+  private resolveBusinessDeletionStartIndex(business: BusinessRecord): number {
+    const deletionState = business.deletion;
+    if (deletionState == null) {
+      return 0;
+    }
+
+    if (deletionState.status === "COMPLETED") {
+      return BUSINESS_DELETION_STAGES.length;
+    }
+
+    const stageIndex = BUSINESS_DELETION_STAGES.indexOf(
+      deletionState.stage as (typeof BUSINESS_DELETION_STAGES)[number]
+    );
+    if (stageIndex < 0) {
+      return 0;
+    }
+
+    return stageIndex;
+  }
+
+  private async persistBusinessDeletionProgress(
+    businessId: string,
+    input: {
+      status: BusinessDeletionStatus;
+      stage: BusinessDeletionStage;
+      summary?: BusinessDeletionSummary | null;
+      lastError?: string;
+      clearLastError?: boolean;
+      completed?: boolean;
+      eventId?: string;
+    }
+  ): Promise<void> {
+    const payload: Record<string, unknown> = {
+      "deletion.status": input.status,
+      "deletion.stage": input.stage,
+      "deletion.updatedAt": new Date().toISOString(),
+    };
+
+    if (input.summary != null) {
+      payload["deletion.summary"] = input.summary;
+    }
+
+    const normalizedEventId = input.eventId?.trim() ?? "";
+    if (normalizedEventId !== "") {
+      payload["deletion.eventId"] = normalizedEventId;
+    }
+
+    const normalizedLastError = input.lastError?.trim() ?? "";
+    if (normalizedLastError !== "") {
+      payload["deletion.lastError"] = normalizedLastError;
+    } else if (input.clearLastError === true) {
+      payload["deletion.lastError"] = FieldValue.delete();
+    }
+
+    if (input.completed === true) {
+      payload["deletion.completedAt"] = new Date().toISOString();
+    } else if (input.completed === false) {
+      payload["deletion.completedAt"] = FieldValue.delete();
+    }
+
+    await FirestoreService.update(COLLECTION_NAME, businessId, payload);
+  }
+
+  private async runBusinessDeletionStage(
+    stage: (typeof BUSINESS_DELETION_STAGES)[number],
+    businessId: string,
+    deletionContext: BusinessDeletionContext
+  ): Promise<void> {
+    switch (stage) {
+      case "mark-business-as-deleted":
+      case "load-deletion-context":
+        return;
+
+      case "delete-appointment-status-tasks":
+        await this.deleteAppointmentStatusTasks(deletionContext.appointmentIds);
+        return;
+
+      case "delete-business-usage":
+        await this.businessUsageService.deleteBusinessUsage(businessId);
+        return;
+
+      case "delete-reviews":
+        await this.deleteDocuments(REVIEWS_COLLECTION, deletionContext.reviewIds);
+        return;
+
+      case "delete-metrics":
+        await this.deleteDocuments(METRICS_COLLECTION, deletionContext.metricIds);
+        return;
+
+      case "delete-user-business-membership-links":
+        await this.deleteUserBusinessMembershipLinks(
+          deletionContext.users,
+          businessId,
+          new Set(deletionContext.membershipIds)
+        );
+        return;
+
+      case "delete-business-memberships":
+        await this.deleteDocuments(
+          BUSINESS_MEMBERSHIPS_COLLECTION,
+          deletionContext.membershipIds
+        );
+        return;
+
+      case "delete-roles":
+        await this.deleteRoleDocuments(deletionContext.roleIds);
+        return;
+
+      case "delete-appointments":
+        await this.deleteDocuments(
+          APPOINTMENTS_COLLECTION,
+          deletionContext.appointmentIds
+        );
+        return;
+
+      case "delete-bookings":
+        await this.deleteDocuments(BOOKINGS_COLLECTION, deletionContext.bookingIds);
+        return;
+
+      case "delete-services":
+        await this.deleteDocuments(SERVICES_COLLECTION, deletionContext.serviceIds);
+        return;
+
+      case "delete-branches":
+        await this.deleteDocuments(BRANCHES_COLLECTION, deletionContext.branchIds);
+        return;
+
+      case "delete-storage-folder":
+        await this.deleteBusinessStorageFolder(businessId);
+        return;
     }
   }
 
@@ -637,8 +1051,19 @@ export class BusinessService {
 
   private async deleteBusinessStorageFolder(businessId: string): Promise<void> {
     const storagePrefix = `bussinesses/${businessId}/`;
-    const bucket = FirestoreDataBase.getAdmin().storage().bucket();
-    await bucket.deleteFiles({ prefix: storagePrefix });
+    try {
+      const bucket = FirestoreDataBase.getAdmin().storage().bucket();
+      await bucket.deleteFiles({ prefix: storagePrefix });
+    } catch (error) {
+      if (shouldSkipStorageCleanup(error)) {
+        const detail = error instanceof Error ? error.message : String(error);
+        logger.warn(
+          `[BusinessService] Se omite la limpieza de storage del negocio ${businessId} porque no hay bucket configurado o válido. detalle=${detail}`
+        );
+        return;
+      }
+      throw error;
+    }
   }
 
   private async getExistingStartPeriods(businessId: string): Promise<string[]> {
@@ -868,6 +1293,8 @@ export class BusinessService {
       return;
     }
 
+    const documentsToDelete: Array<{ userId: string; linkId: string }> = [];
+
     await Promise.all(
       users.map(async (user) => {
         const links = await FirestoreService.getAllFromSubcollection<FirestoreMembershipLinkDoc>(
@@ -876,71 +1303,111 @@ export class BusinessService {
           USER_BUSINESS_MEMBERSHIPS_SUBCOLLECTION
         );
 
-        const linkIdsToDelete = links
-          .filter((link) => {
-            const linkBusinessId = link.businessId?.trim() ?? "";
-            const linkMembershipId = link.membershipId?.trim() ?? "";
+        links.forEach((link) => {
+          const linkBusinessId = link.businessId?.trim() ?? "";
+          const linkMembershipId = link.membershipId?.trim() ?? "";
 
-            return (
-              linkBusinessId === normalizedBusinessId ||
-              membershipIds.has(linkMembershipId) ||
-              membershipIds.has(link.id)
-            );
-          })
-          .map((link) => link.id);
-
-        await Promise.all(
-          linkIdsToDelete.map((linkId) =>
-            FirestoreService.deleteSubcollectionDocument(
-              USERS_COLLECTION,
-              user.id,
-              USER_BUSINESS_MEMBERSHIPS_SUBCOLLECTION,
-              linkId
-            )
-          )
-        );
+          if (
+            linkBusinessId === normalizedBusinessId ||
+            membershipIds.has(linkMembershipId) ||
+            membershipIds.has(link.id)
+          ) {
+            documentsToDelete.push({
+              userId: user.id,
+              linkId: link.id,
+            });
+          }
+        });
       })
     );
+
+    for (
+      let index = 0;
+      index < documentsToDelete.length;
+      index += FIRESTORE_DELETE_BATCH_SIZE
+    ) {
+      const chunk = documentsToDelete.slice(index, index + FIRESTORE_DELETE_BATCH_SIZE);
+      await this.firestoreConsistencyService.runBatch(
+        "BusinessService.deleteUserBusinessMembershipLinks",
+        async (context) => {
+          chunk.forEach((item) => {
+            context.batch.delete(
+              context.subdoc(
+                USERS_COLLECTION,
+                item.userId,
+                USER_BUSINESS_MEMBERSHIPS_SUBCOLLECTION,
+                item.linkId
+              )
+            );
+          });
+        }
+      );
+    }
   }
 
   private async deleteRoleDocuments(roleIds: string[]): Promise<void> {
-    await Promise.all(
-      normalizeUniqueStrings(roleIds).map(async (roleId) => {
-        await FirestoreService.deleteSubcollectionDocuments(
-          ROLES_COLLECTION,
-          roleId,
-          ROLE_PERMISSIONS_SUBCOLLECTION
+    for (const roleId of normalizeUniqueStrings(roleIds)) {
+      const permissions = await FirestoreService.getAllFromSubcollection<FirestoreEntityWithId>(
+        ROLES_COLLECTION,
+        roleId,
+        ROLE_PERMISSIONS_SUBCOLLECTION
+      );
+
+      const permissionIds = normalizeUniqueStrings(
+        permissions.map((permission) => permission.id)
+      );
+
+      for (
+        let index = 0;
+        index < permissionIds.length;
+        index += FIRESTORE_DELETE_BATCH_SIZE
+      ) {
+        const chunk = permissionIds.slice(index, index + FIRESTORE_DELETE_BATCH_SIZE);
+        await this.firestoreConsistencyService.runBatch(
+          "BusinessService.deleteRoleDocuments.permissions",
+          async (context) => {
+            chunk.forEach((permissionId) => {
+              context.batch.delete(
+                context.subdoc(
+                  ROLES_COLLECTION,
+                  roleId,
+                  ROLE_PERMISSIONS_SUBCOLLECTION,
+                  permissionId
+                )
+              );
+            });
+          }
         );
-        await this.deleteDocumentIfExists(ROLES_COLLECTION, roleId);
-      })
-    );
+      }
+
+      await this.firestoreConsistencyService.runBatch(
+        "BusinessService.deleteRoleDocuments.role",
+        async (context) => {
+          context.batch.delete(context.doc(ROLES_COLLECTION, roleId));
+        }
+      );
+    }
   }
 
   private async deleteDocuments(
     collectionName: string,
     ids: string[]
   ): Promise<void> {
-    await Promise.all(
-      normalizeUniqueStrings(ids).map((id) =>
-        this.deleteDocumentIfExists(collectionName, id)
-      )
-    );
-  }
-
-  private async deleteDocumentIfExists(
-    collectionName: string,
-    id: string
-  ): Promise<void> {
-    try {
-      await FirestoreService.delete(collectionName, id);
-    } catch (error) {
-      if (
-        error instanceof CustomError &&
-        error.statusCode === 404
-      ) {
-        return;
-      }
-      throw error;
+    const normalizedIds = normalizeUniqueStrings(ids);
+    for (
+      let index = 0;
+      index < normalizedIds.length;
+      index += FIRESTORE_DELETE_BATCH_SIZE
+    ) {
+      const chunk = normalizedIds.slice(index, index + FIRESTORE_DELETE_BATCH_SIZE);
+      await this.firestoreConsistencyService.runBatch(
+        `BusinessService.deleteDocuments.${collectionName}`,
+        async (context) => {
+          chunk.forEach((id) => {
+            context.batch.delete(context.doc(collectionName, id));
+          });
+        }
+      );
     }
   }
 
