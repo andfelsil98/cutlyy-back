@@ -110,7 +110,7 @@ export class OutboxController {
     const expectedToken = this.internalToken.trim();
     if (expectedToken === "") {
       throw CustomError.internalServerError(
-        "Configuración incompleta para automatización interna: CLOUD_TASKS_INTERNAL_TOKEN"
+        "Configuración incompleta para automatización interna"
       );
     }
 
@@ -141,7 +141,7 @@ export class OutboxController {
 
     if (!OUTBOX_EVENT_STATUSES.includes(parsed as OutboxEventStatus)) {
       throw CustomError.badRequest(
-        `status inválido. Valores permitidos: ${OUTBOX_EVENT_STATUSES.join(", ")}`
+        "Estado inválido. Valores permitidos: pendiente, en proceso, completado, con error o pausado"
       );
     }
 

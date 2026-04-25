@@ -34,7 +34,7 @@ export class FirestoreDataBase {
 
   static getAdmin(): typeof admin {
     if (!this.isInitialized) {
-      throw new Error("Firebase Admin no ha sido inicializado.");
+      throw new Error("Firebase no ha sido inicializado.");
     }
     return admin;
   }

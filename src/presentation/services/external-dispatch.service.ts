@@ -187,7 +187,7 @@ export class ExternalDispatchService {
     const normalizedError = errorMessage.trim();
     if (normalizedError === "") {
       throw CustomError.badRequest(
-        "errorMessage es requerido para marcar FAILED un external dispatch"
+        "El mensaje de error es requerido para marcar el despacho externo como fallido"
       );
     }
 
@@ -212,7 +212,7 @@ export class ExternalDispatchService {
     const normalizedError = errorMessage.trim();
     if (normalizedError === "") {
       throw CustomError.badRequest(
-        "errorMessage es requerido para marcar AMBIGUOUS un external dispatch"
+        "El mensaje de error es requerido para marcar el despacho externo como ambiguo"
       );
     }
 

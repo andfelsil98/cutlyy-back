@@ -43,14 +43,14 @@ export class AppointmentStatusTaskSchedulerService
     const targetBaseUrl = this.config.targetBaseUrl.trim();
     if (targetBaseUrl === "") {
       throw CustomError.internalServerError(
-        "Configuración incompleta de Cloud Tasks: CLOUD_TASKS_TARGET_BASE_URL"
+        "Configuración incompleta para tareas automáticas"
       );
     }
 
     const internalToken = this.config.internalToken.trim();
     if (internalToken === "") {
       throw CustomError.internalServerError(
-        "Configuración incompleta de Cloud Tasks: CLOUD_TASKS_INTERNAL_TOKEN"
+        "Configuración incompleta para tareas automáticas"
       );
     }
 

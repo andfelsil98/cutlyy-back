@@ -4,6 +4,7 @@ import type {
   SendWhatsAppTemplateMessagePayload,
   WhatsAppMessageProvider,
 } from "../../domain/interfaces/whatsapp.interface";
+import { logger } from "../logger/logger";
 
 export interface InfobipWhatsAppApiConfig {
   baseUrl: string;
@@ -107,10 +108,13 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
       const responseBody = (await this.parseResponseJson(response)) as InfobipSendResponse;
 
       if (!response.ok) {
-        throw CustomError.internalServerError(
-          `Infobip rechazó el envío. status=${response.status}. detalle=${this.extractProviderError(
+        logger.error(
+          `[InfobipWhatsAppApiClient] Envío rechazado. status=${response.status}. detalle=${this.extractProviderError(
             responseBody
           )}. request=${this.buildRequestContext(messageRequest)}. body=${JSON.stringify(responseBody)}`
+        );
+        throw CustomError.internalServerError(
+          "No se pudo enviar el mensaje por WhatsApp"
         );
       }
 
@@ -121,19 +125,25 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
           : "";
 
       if (messageId === "") {
-        throw CustomError.internalServerError(
-          `Infobip respondió sin messageId. request=${this.buildRequestContext(
+        logger.error(
+          `[InfobipWhatsAppApiClient] Respuesta sin messageId. request=${this.buildRequestContext(
             messageRequest
           )}. body=${JSON.stringify(responseBody)}`
+        );
+        throw CustomError.internalServerError(
+          "No se pudo confirmar el envío del mensaje por WhatsApp"
         );
       }
 
       const statusName = message.status?.groupName?.toUpperCase() ?? "";
       if (statusName === "REJECTED" || statusName === "UNDELIVERABLE") {
-        throw CustomError.internalServerError(
-          `Infobip devolvió un estado de rechazo. detalle=${this.extractProviderError(
+        logger.error(
+          `[InfobipWhatsAppApiClient] Estado de rechazo. detalle=${this.extractProviderError(
             responseBody
-          )}. request=${this.buildRequestContext(messageRequest)}. body=${JSON.stringify(responseBody)}`,
+          )}. request=${this.buildRequestContext(messageRequest)}. body=${JSON.stringify(responseBody)}`
+        );
+        throw CustomError.internalServerError(
+          "El mensaje de WhatsApp fue rechazado por el proveedor",
           "INFOBIP_MESSAGE_REJECTED"
         );
       }
@@ -149,24 +159,33 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
 
       if (error instanceof Error && error.name === "AbortError") {
         throw CustomError.internalServerError(
-          "Tiempo de espera agotado al enviar mensaje por Infobip"
+          "No se pudo enviar el mensaje por WhatsApp por tiempo de espera agotado"
         );
       }
 
       if (error instanceof TypeError) {
+        logger.error(
+          `[InfobipWhatsAppApiClient] Error de conexión. detalle=${error.message}`
+        );
         throw CustomError.internalServerError(
-          `No se pudo conectar con Infobip. Verifica INFOBIP_BASE_URL/red. detalle=${error.message}`
+          "No se pudo conectar con el proveedor de mensajería"
         );
       }
 
       if (error instanceof Error) {
+        logger.error(
+          `[InfobipWhatsAppApiClient] Error enviando mensaje. detalle=${error.message}`
+        );
         throw CustomError.internalServerError(
-          `No se pudo enviar el mensaje por WhatsApp. detalle=${error.message}`
+          "No se pudo enviar el mensaje por WhatsApp"
         );
       }
 
+      logger.error(
+        `[InfobipWhatsAppApiClient] Error desconocido enviando mensaje. detalle=${String(error)}`
+      );
       throw CustomError.internalServerError(
-        `No se pudo enviar el mensaje por WhatsApp. detalle=${String(error)}`
+        "No se pudo enviar el mensaje por WhatsApp"
       );
     } finally {
       clearTimeout(timeout);
@@ -287,8 +306,11 @@ export class InfobipWhatsAppApiClient implements WhatsAppMessageProvider {
     }
 
     if (missing.length > 0) {
+      logger.error(
+        `[InfobipWhatsAppApiClient] Configuración incompleta. missing=${missing.join(", ")}`
+      );
       throw CustomError.internalServerError(
-        `Configuración incompleta de Infobip: ${missing.join(", ")}`
+        "Configuración incompleta del proveedor de mensajería"
       );
     }
   }

@@ -44,7 +44,7 @@ export function validateCreateBusinessDto(body: unknown): CreateBusinessDto {
   const type = b.type;
   if (!isBusinessType(type)) {
     throw CustomError.badRequest(
-      `type debe ser uno de: ${BUSINESS_TYPES.join(", ")}`
+      "El tipo de negocio debe ser barbería, peluquería o salón de belleza"
     );
   }
   const planIdRaw = b.planId;

@@ -35,6 +35,20 @@ function toNameKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function formatProtectedRoleNameForClient(value: string): string {
+  const normalized = toNameKey(value);
+  if (normalized === "admin") return "administrador";
+  if (normalized === "owner") return "propietario";
+  if (normalized === "super admin") return "superadministrador";
+  return value;
+}
+
+function formatRoleTypeForClient(type: RoleType): string {
+  if (type === "BUSINESS") return "de negocio";
+  if (type === "CROSS_BUSINESS") return "multinegocio";
+  return "global";
+}
+
 function sortRolesByCreatedAtDesc(left: Role, right: Role): number {
   return (right.createdAt ?? "").localeCompare(left.createdAt ?? "");
 }
@@ -254,8 +268,9 @@ export class RoleService {
       };
       if (dto.name !== undefined) {
         if (protectedRole && toNameKey(dto.name) !== toNameKey(role.name)) {
+          const protectedRoleName = formatProtectedRoleNameForClient(protectedRole.name);
           throw CustomError.badRequest(
-            `No se puede cambiar el nombre del rol protegido ${protectedRole.name}`
+            `No se puede cambiar el nombre del rol protegido ${protectedRoleName}`
           );
         }
 
@@ -274,8 +289,9 @@ export class RoleService {
 
       if (dto.permissions !== undefined) {
         if (protectedRole && dto.permissions.some((operation) => operation.op === "remove")) {
+          const protectedRoleName = formatProtectedRoleNameForClient(protectedRole.name);
           throw CustomError.badRequest(
-            `No se pueden remover permisos del rol protegido ${protectedRole.name}`
+            `No se pueden remover permisos del rol protegido ${protectedRoleName}`
           );
         }
 
@@ -350,8 +366,9 @@ export class RoleService {
         type: role.type,
       });
       if (protectedRole) {
+        const protectedRoleName = formatProtectedRoleNameForClient(protectedRole.name);
         throw CustomError.badRequest(
-          `No se puede eliminar el rol protegido ${protectedRole.name}`
+          `No se puede eliminar el rol protegido ${protectedRoleName}`
         );
       }
 
@@ -430,8 +447,9 @@ export class RoleService {
     });
 
     if (invalidPermission) {
+      const readableType = formatRoleTypeForClient(roleType);
       throw CustomError.badRequest(
-        `El permiso ${invalidPermission.id} no es compatible con el tipo de rol ${roleType}`
+        `El permiso ${invalidPermission.id} no es compatible con el tipo de rol ${readableType}`
       );
     }
   }

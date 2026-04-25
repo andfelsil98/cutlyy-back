@@ -10,12 +10,12 @@ import type {
 
 export function parseEntityType(value: unknown): MetricType {
   if (typeof value !== "string") {
-    throw CustomError.badRequest("entityType es requerido y debe ser BUSSINESS, BRANCH o EMPLOYEE");
+    throw CustomError.badRequest("El tipo de entidad es requerido y debe ser negocio, sede o empleado");
   }
 
   const normalized = value.trim().toUpperCase();
   if (normalized !== "BUSSINESS" && normalized !== "BRANCH" && normalized !== "EMPLOYEE") {
-    throw CustomError.badRequest("entityType debe ser BUSSINESS, BRANCH o EMPLOYEE");
+    throw CustomError.badRequest("El tipo de entidad debe ser negocio, sede o empleado");
   }
 
   return normalized as MetricType;
@@ -53,7 +53,7 @@ export function parseMetricTypes(value: unknown): MetricCalculationType[] {
       if (direct != null) return direct;
 
       throw CustomError.badRequest(
-        "metricTypes contiene un valor inválido. Usa: REVENUE, APPOINTMENTS_COUNT, AVERAGE_TICKET, CANCELLATION_RATE, COMPLETION_RATE, EMPLOYEE_PRODUCTIVITY, BUSINESS_GROWTH"
+        "metricTypes contiene un valor inválido. Usa métricas de ingresos, cantidad de citas, ticket promedio, cancelación, finalización, productividad de empleados o crecimiento del negocio"
       );
     });
 
@@ -67,13 +67,13 @@ export function parseMetricTypes(value: unknown): MetricCalculationType[] {
 export function parseMetricTimeFrame(value: unknown): MetricTimeFrame | undefined {
   if (value == null) return undefined;
   if (typeof value !== "string") {
-    throw CustomError.badRequest("timeframe debe ser DAILY o MONTHLY");
+    throw CustomError.badRequest("La ventana de tiempo debe ser diaria o mensual");
   }
 
   const normalized = value.trim().toUpperCase();
   if (normalized === "") return undefined;
   if (normalized !== "DAILY" && normalized !== "MONTHLY") {
-    throw CustomError.badRequest("timeframe debe ser DAILY o MONTHLY");
+    throw CustomError.badRequest("La ventana de tiempo debe ser diaria o mensual");
   }
 
   return normalized as MetricTimeFrame;

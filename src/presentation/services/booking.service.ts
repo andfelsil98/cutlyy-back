@@ -132,7 +132,7 @@ export class BookingService {
 
       if (requestedStatus != null && !BOOKING_STATUSES.includes(requestedStatus)) {
         throw CustomError.badRequest(
-          "status debe ser CREATED, CANCELLED, FINISHED o DELETED"
+          "El estado debe ser creado, cancelado, finalizado o eliminado"
         );
       }
 
@@ -785,7 +785,7 @@ export class BookingService {
 
       if (booking.status === "DELETED" || booking.status === "CANCELLED") {
         throw CustomError.badRequest(
-          "No se pueden registrar abonos en un agendamiento CANCELLED o DELETED"
+          "No se pueden registrar abonos en un agendamiento cancelado o eliminado"
         );
       }
 
@@ -834,7 +834,7 @@ export class BookingService {
       const booking = await this.getBookingById(id);
       if (booking.status === "DELETED" || booking.status === "CANCELLED") {
         throw CustomError.badRequest(
-          "No se puede cambiar el medio de pago de un agendamiento CANCELLED o DELETED"
+          "No se puede cambiar el medio de pago de un agendamiento cancelado o eliminado"
         );
       }
 
@@ -849,7 +849,7 @@ export class BookingService {
 
       if (!canEditPaymentMethod) {
         throw CustomError.badRequest(
-          "Solo se puede cambiar el medio de pago cuando el agendamiento tiene citas en estado CREATED, IN_PROGRESS o FINISHED"
+          "Solo se puede cambiar el medio de pago cuando el agendamiento tiene citas en estado creado, en progreso o finalizado"
         );
       }
 
@@ -916,7 +916,7 @@ export class BookingService {
           existingBooking.status === "FINISHED")
       ) {
         throw CustomError.badRequest(
-          "No se puede editar un booking con estado FINISHED, DELETED o CANCELLED"
+          "No se puede editar un agendamiento con estado finalizado, eliminado o cancelado"
         );
       }
 
@@ -2508,7 +2508,7 @@ export class BookingService {
         appointment.status !== "CANCELLED"
       ) {
         throw CustomError.badRequest(
-          `Solo se puede marcar en CREATED la cita ${appointmentId} si está CANCELLED`
+          `Solo se puede marcar como creada la cita ${appointmentId} si está cancelada`
         );
       }
 
@@ -2638,7 +2638,7 @@ export class BookingService {
 
     if (nextStatus === "CREATED" && currentStatus === "FINISHED") {
       throw CustomError.badRequest(
-        "No se puede marcar en CREATED un agendamiento finalizado"
+        "No se puede marcar como creado un agendamiento finalizado"
       );
     }
 
@@ -2649,7 +2649,7 @@ export class BookingService {
       );
       if (hasFinishedAppointment) {
         throw CustomError.badRequest(
-          "No se puede marcar en CANCELLED un agendamiento con citas finalizadas"
+          "No se puede marcar como cancelado un agendamiento con citas finalizadas"
         );
       }
     }

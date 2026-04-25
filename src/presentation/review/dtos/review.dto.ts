@@ -24,7 +24,7 @@ export function validateReviewIdParam(id: unknown): string {
 
 function validateTargetType(raw: unknown): ReviewTargetType {
   if (raw !== "EMPLOYEE" && raw !== "BRANCH") {
-    throw CustomError.badRequest("targetType debe ser EMPLOYEE o BRANCH");
+    throw CustomError.badRequest("El tipo de reseña debe ser empleado o sede");
   }
   return raw;
 }
@@ -74,7 +74,7 @@ export function validateCreateReviewDto(body: unknown): CreateReviewDto {
 
   if (targetType === "EMPLOYEE" && !appointmentId) {
     throw CustomError.badRequest(
-      "appointmentId es requerido cuando targetType es EMPLOYEE"
+      "La cita es requerida cuando la reseña es para un empleado"
     );
   }
 

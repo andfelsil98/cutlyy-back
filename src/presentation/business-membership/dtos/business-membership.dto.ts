@@ -57,7 +57,7 @@ export function validateMembershipStatusQuery(
     )
   ) {
     throw CustomError.badRequest(
-      "status debe ser ACTIVE, INACTIVE o PENDING cuando se proporcione"
+      "El estado debe ser activo, inactivo o pendiente cuando se proporcione"
     );
   }
 

@@ -545,7 +545,7 @@ export class OutboxService {
     const normalizedErrorMessage = errorMessage.trim();
     if (normalizedErrorMessage === "") {
       throw CustomError.badRequest(
-        "errorMessage es requerido para marcar un evento de outbox como ERROR"
+        "El mensaje de error es requerido para marcar un evento de salida como error"
       );
     }
 
@@ -602,7 +602,7 @@ export class OutboxService {
     const normalizedErrorMessage = errorMessage.trim();
     if (normalizedErrorMessage === "") {
       throw CustomError.badRequest(
-        "errorMessage es requerido para marcar un evento de outbox como PAUSED"
+        "El mensaje de error es requerido para marcar un evento de salida como pausado"
       );
     }
 

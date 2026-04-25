@@ -47,7 +47,7 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
       const taskName = response.name?.trim() ?? "";
       if (taskName === "") {
         throw CustomError.internalServerError(
-          "Google Cloud Tasks respondió sin nombre de tarea"
+          "No se pudo programar la tarea automática"
         );
       }
 
@@ -71,8 +71,11 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
             ? error
             : JSON.stringify(error);
 
+      logger.error(
+        `[GoogleCloudTasksQueueProvider] No se pudo crear la tarea. detalle=${details}`
+      );
       throw CustomError.internalServerError(
-        `No se pudo crear la task en Google Cloud Tasks. detalle=${details}`
+        "No se pudo programar la tarea automática"
       );
     }
   }
@@ -86,7 +89,7 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
     const taskName = this.resolveTaskName(projectId, location, queue, taskId);
 
     if (taskName == null) {
-      throw CustomError.badRequest("No se puede eliminar una task sin taskId");
+      throw CustomError.badRequest("No se puede eliminar una tarea sin identificador");
     }
 
     try {
@@ -105,8 +108,11 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
             ? error
             : JSON.stringify(error);
 
+      logger.error(
+        `[GoogleCloudTasksQueueProvider] No se pudo eliminar la tarea. detalle=${details}`
+      );
       throw CustomError.internalServerError(
-        `No se pudo eliminar la task en Google Cloud Tasks. detalle=${details}`
+        "No se pudo eliminar la tarea automática"
       );
     }
   }
@@ -322,8 +328,11 @@ export class GoogleCloudTasksQueueProvider implements TaskQueueProvider {
     }
 
     if (missing.length > 0) {
+      logger.error(
+        `[GoogleCloudTasksQueueProvider] Configuración incompleta. missing=${missing.join(", ")}`
+      );
       throw CustomError.internalServerError(
-        `Configuración incompleta de Cloud Tasks: ${missing.join(", ")}`
+        "Configuración incompleta para tareas automáticas"
       );
     }
   }

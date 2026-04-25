@@ -65,7 +65,7 @@ function validateStatus(rawStatus: unknown): Exclude<AppointmentStatus, "DELETED
     normalizedStatus !== "FINISHED"
   ) {
     throw CustomError.badRequest(
-      "status debe ser CREATED, CANCELLED o FINISHED"
+      "El estado debe ser creado, cancelado o finalizado"
     );
   }
 

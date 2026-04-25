@@ -1,6 +1,5 @@
 import { CustomError } from "../../../domain/errors/custom-error";
 import {
-  ACCESS_ENTITY_TYPES,
   isAccessEntityType,
   type AccessEntityType,
 } from "../../../domain/constants/access-control.constants";
@@ -38,7 +37,7 @@ export function validateCreateModuleDto(body: unknown): CreateModuleDto {
   const typeRaw = b.type;
   if (!isAccessEntityType(typeRaw)) {
     throw CustomError.badRequest(
-      `type debe ser uno de: ${ACCESS_ENTITY_TYPES.join(", ")}`
+      "El tipo debe ser de negocio, global o híbrido"
     );
   }
   const type = typeRaw;

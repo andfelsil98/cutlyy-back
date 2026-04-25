@@ -426,7 +426,7 @@ export class ReviewService {
       const branchId = dto.branchId?.trim() ?? "";
       if (branchId === "") {
         throw CustomError.badRequest(
-          "branchId es requerido cuando targetType es BRANCH"
+          "La sede es requerida cuando la reseña es para una sede"
         );
       }
       return branchId;
@@ -435,7 +435,7 @@ export class ReviewService {
     const branchIdFromBooking = booking.branchId?.trim() ?? "";
     if (branchIdFromBooking === "") {
       throw CustomError.badRequest(
-        "El booking no tiene branchId válido para crear la reseña del empleado"
+        "El agendamiento no tiene una sede válida para crear la reseña del empleado"
       );
     }
     return branchIdFromBooking;
@@ -455,7 +455,7 @@ export class ReviewService {
     if (targetType === "BRANCH") {
       if (targetId !== branch.id) {
         throw CustomError.badRequest(
-          "Cuando targetType es BRANCH, targetId debe ser igual a branchId"
+          "Cuando la reseña es para una sede, el objetivo debe coincidir con la sede"
         );
       }
       return;
@@ -463,13 +463,13 @@ export class ReviewService {
 
     if (!appointment) {
       throw CustomError.badRequest(
-        "appointmentId es requerido cuando targetType es EMPLOYEE"
+        "La cita es requerida cuando la reseña es para un empleado"
       );
     }
 
     if (appointment.employeeId !== targetId) {
       throw CustomError.badRequest(
-        "Cuando targetType es EMPLOYEE, targetId debe coincidir con employeeId de la cita"
+        "Cuando la reseña es para un empleado, el objetivo debe coincidir con el empleado de la cita"
       );
     }
   }

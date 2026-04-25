@@ -39,13 +39,13 @@ export class WhatsAppController {
     const expectedToken = this.internalToken.trim();
     if (expectedToken === "") {
       throw CustomError.internalServerError(
-        "Configuración incompleta de Cloud Tasks: CLOUD_TASKS_INTERNAL_TOKEN"
+        "Configuración incompleta para automatización interna"
       );
     }
 
     const receivedToken = req.header(CLOUD_TASK_TOKEN_HEADER)?.trim() ?? "";
     if (receivedToken === "" || receivedToken !== expectedToken) {
-      throw CustomError.unauthorized("Solicitud de task no autorizada");
+      throw CustomError.unauthorized("Solicitud de automatización no autorizada");
     }
   }
 }

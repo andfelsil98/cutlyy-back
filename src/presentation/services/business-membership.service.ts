@@ -113,7 +113,7 @@ export class BusinessMembershipService {
         !BUSINESS_MEMBERSHIP_QUERYABLE_STATUSES.includes(requestedStatus)
       ) {
         throw CustomError.badRequest(
-          "status debe ser ACTIVE, INACTIVE o PENDING cuando se proporcione"
+          "El estado debe ser activo, inactivo o pendiente cuando se proporcione"
         );
       }
 
@@ -542,7 +542,7 @@ export class BusinessMembershipService {
           membership,
           nextStatus: newStatus,
           errorMessage:
-            "Cada negocio debe tener al menos una persona ACTIVE con el rol Admin. No puedes inactivar al único Admin del negocio.",
+            "Cada negocio debe tener al menos una persona activa con el rol administrador. No puedes inactivar al único administrador del negocio.",
         });
 
         if (membership.isEmployee === true) {
@@ -585,7 +585,7 @@ export class BusinessMembershipService {
 
       if (nextIsEmployee && membership.status !== "ACTIVE") {
         throw CustomError.badRequest(
-          "Solo se puede marcar como empleado una membresía ACTIVE"
+          "Solo se puede marcar como empleado una membresía activa"
         );
       }
 
@@ -700,24 +700,24 @@ export class BusinessMembershipService {
         nextRole: role,
         nextStatus: targetMembership.status,
         errorMessage:
-          "Cada negocio debe tener al menos una persona ACTIVE con el rol Admin. No puedes cambiar el rol del único Admin del negocio.",
+          "Cada negocio debe tener al menos una persona activa con el rol administrador. No puedes cambiar el rol del único administrador del negocio.",
       });
 
       if (targetBusinessId === "") {
         if (!isGlobalRoleType(role.type)) {
           throw CustomError.badRequest(
-            "Solo se puede asignar un rol GLOBAL a una membresía global"
+            "Solo se puede asignar un rol global a una membresía global"
           );
         }
       } else {
         if (!isBusinessRoleType(role.type)) {
           throw CustomError.badRequest(
-            "Solo se puede asignar un rol BUSINESS o CROSS_BUSINESS a una membresía de negocio"
+            "Solo se puede asignar un rol de negocio o multinegocio a una membresía de negocio"
           );
         }
         if (role.type === "BUSINESS" && role.businessId?.trim() !== targetBusinessId) {
           throw CustomError.badRequest(
-            "No se puede asignar un rol BUSINESS de otro negocio"
+            "No se puede asignar un rol de negocio de otro negocio"
           );
         }
       }
@@ -743,7 +743,7 @@ export class BusinessMembershipService {
 
       if (membership.status !== "ACTIVE") {
         throw CustomError.badRequest(
-          "Solo se puede asignar sede a una membresía ACTIVE"
+          "Solo se puede asignar sede a una membresía activa"
         );
       }
 

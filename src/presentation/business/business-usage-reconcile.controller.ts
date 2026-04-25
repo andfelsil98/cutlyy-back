@@ -28,7 +28,7 @@ export class BusinessUsageReconcileController {
     const expectedToken = this.internalToken.trim();
     if (expectedToken === "") {
       throw CustomError.internalServerError(
-        "Configuración incompleta para automatización interna: CLOUD_TASKS_INTERNAL_TOKEN"
+        "Configuración incompleta para automatización interna"
       );
     }
 

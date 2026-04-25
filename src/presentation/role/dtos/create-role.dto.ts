@@ -1,6 +1,5 @@
 import { CustomError } from "../../../domain/errors/custom-error";
 import {
-  ROLE_TYPES,
   isRoleType,
   type RoleType,
 } from "../../../domain/constants/access-control.constants";
@@ -31,7 +30,7 @@ export function validateCreateRoleDto(body: unknown): CreateRoleDto {
   const typeRaw = b.type;
   if (!isRoleType(typeRaw)) {
     throw CustomError.badRequest(
-      `type debe ser uno de: ${ROLE_TYPES.join(", ")}`
+      "El tipo de rol debe ser de negocio, multinegocio o global"
     );
   }
   const type = typeRaw;
@@ -41,13 +40,13 @@ export function validateCreateRoleDto(body: unknown): CreateRoleDto {
   if (type !== "BUSINESS") {
     if (typeof businessIdRaw === "string" && businessIdRaw.trim() !== "") {
       throw CustomError.badRequest(
-        "businessId no debe enviarse cuando type es CROSS_BUSINESS o GLOBAL"
+        "businessId no debe enviarse cuando el tipo de rol es multinegocio o global"
       );
     }
   } else {
     if (typeof businessIdRaw !== "string" || businessIdRaw.trim() === "") {
       throw CustomError.badRequest(
-        "businessId es requerido y debe ser un texto no vacío cuando type es BUSINESS"
+        "businessId es requerido y debe ser un texto no vacío cuando el tipo de rol es de negocio"
       );
     }
     businessId = businessIdRaw.trim();

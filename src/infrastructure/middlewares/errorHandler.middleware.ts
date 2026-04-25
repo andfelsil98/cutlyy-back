@@ -48,7 +48,7 @@ export const errorHandler: ErrorRequestHandler = (
   logger.error(fullMessage);
 
   res.status(500).json({
-    error: "Internal Server Error",
+    error: "Error interno del servidor",
     timestamp,
   });
 };

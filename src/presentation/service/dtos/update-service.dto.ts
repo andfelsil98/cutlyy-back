@@ -61,7 +61,7 @@ export function validateUpdateServiceDto(body: unknown): UpdateServiceBodyDto {
   let status: "ACTIVE" | "INACTIVE" | undefined;
   if (statusRaw !== undefined) {
     if (statusRaw !== "ACTIVE" && statusRaw !== "INACTIVE") {
-      throw CustomError.badRequest("status debe ser ACTIVE o INACTIVE cuando se proporcione");
+      throw CustomError.badRequest("El estado debe ser activo o inactivo cuando se proporcione");
     }
     status = statusRaw;
   }

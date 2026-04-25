@@ -257,7 +257,7 @@ export class UserService {
       return {
         id: user.id,
         message:
-          "Usuario eliminado correctamente. Registro de Firebase Auth eliminado, membresías marcadas como DELETED y subcolección businessMemberships eliminada.",
+          "Usuario eliminado correctamente. Registro de autenticación eliminado, membresías marcadas como eliminadas y subcolección de membresías del usuario eliminada.",
       };
     } catch (error) {
       if (error instanceof CustomError) throw error;
@@ -305,7 +305,7 @@ export class UserService {
       );
 
       throw CustomError.internalServerError(
-        "No se pudo eliminar el usuario en Firebase Authentication"
+        "No se pudo eliminar el usuario en el sistema de autenticación"
       );
     }
   }
@@ -329,14 +329,14 @@ export class UserService {
         return;
       }
       if (code === "auth/email-already-exists") {
-        throw CustomError.conflict("Ya existe un usuario en Authentication con este correo");
+        throw CustomError.conflict("Ya existe un usuario con este correo en el sistema de autenticación");
       }
       if (code === "auth/invalid-email") {
-        throw CustomError.badRequest("email inválido para Firebase Authentication");
+        throw CustomError.badRequest("El correo no es válido para autenticación");
       }
 
       throw CustomError.internalServerError(
-        "No se pudo actualizar el usuario en Firebase Authentication"
+        "No se pudo actualizar el usuario en el sistema de autenticación"
       );
     }
   }

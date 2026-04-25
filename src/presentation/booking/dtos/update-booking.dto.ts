@@ -301,7 +301,7 @@ export function validateUpdateBookingDto(body: unknown): UpdateBookingDto {
       normalizedStatus !== "DELETED"
     ) {
       throw CustomError.badRequest(
-        "status debe ser CREATED, CANCELLED, FINISHED o DELETED"
+        "El estado debe ser creado, cancelado, finalizado o eliminado"
       );
     }
     status = normalizedStatus as BookingStatus;

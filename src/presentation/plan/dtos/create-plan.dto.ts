@@ -67,13 +67,13 @@ export function validateCreatePlanDto(body: unknown): CreatePlanDto {
 
   if (!isPlanStatus(status)) {
     throw CustomError.badRequest(
-      `status es requerido y debe ser uno de: ${PLAN_STATUSES.join(", ")}`
+      "El estado es requerido y debe ser activo o inactivo"
     );
   }
 
   if (!isPlanBillingInterval(billingInterval)) {
     throw CustomError.badRequest(
-      `billingInterval es requerido y debe ser uno de: ${PLAN_BILLING_INTERVALS.join(", ")}`
+      "El intervalo de facturación es requerido y debe ser mensual, trimestral o anual"
     );
   }
 

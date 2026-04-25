@@ -3,10 +3,7 @@ import { validateConsecutivePrefix } from "../../../domain/utils/booking-consecu
 import { validateAndNormalizeStartPeriods } from "../../../domain/utils/usage-period.utils";
 import { normalizeSpaces } from "../../../domain/utils/string.utils";
 import type { BusinessType } from "./create-business.dto";
-import {
-  BUSINESS_TYPES,
-  isBusinessType,
-} from "./create-business.dto";
+import { isBusinessType } from "./create-business.dto";
 import type { CreateServiceItemDto } from "../../service/dtos/create-service.dto";
 import { validateCreateServiceItemDto } from "../../service/dtos/create-service.dto";
 import type { CreateBranchItemDto } from "../../branch/dtos/create-branch.dto";
@@ -45,7 +42,7 @@ export function validateUpdateBusinessDto(body: unknown): UpdateBusinessDto {
   if (type !== undefined) {
     if (!isBusinessType(type)) {
       throw CustomError.badRequest(
-        `type debe ser uno de: ${BUSINESS_TYPES.join(", ")}`
+        "El tipo de negocio debe ser barbería, peluquería o salón de belleza"
       );
     }
     result.type = type;

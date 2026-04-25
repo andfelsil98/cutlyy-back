@@ -41,7 +41,7 @@ function parseBookingStatusQuery(value: unknown): BookingStatus | undefined {
   }
 
   if (!BOOKING_STATUSES.includes(normalized as BookingStatus)) {
-    throw new Error("status debe ser CREATED, CANCELLED, FINISHED o DELETED");
+    throw new Error("El estado debe ser creado, cancelado, finalizado o eliminado");
   }
 
   return normalized as BookingStatus;

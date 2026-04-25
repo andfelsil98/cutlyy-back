@@ -176,10 +176,10 @@ export class AuthService {
       return CustomError.conflict("Ya existe un usuario registrado con este correo");
     }
     if (code === "auth/invalid-password") {
-      return CustomError.badRequest("password inválido para Firebase Authentication");
+      return CustomError.badRequest("La contraseña no es válida para autenticación");
     }
     if (code === "auth/invalid-email") {
-      return CustomError.badRequest("email inválido para Firebase Authentication");
+      return CustomError.badRequest("El correo no es válido para autenticación");
     }
     return CustomError.internalServerError("Error interno del servidor");
   }

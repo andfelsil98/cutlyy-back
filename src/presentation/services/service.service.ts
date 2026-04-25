@@ -70,7 +70,7 @@ export class ServiceService {
       for (const item of dto.services) {
         const nameKey = toNameKey(item.name);
         if (existingNameKeys.has(nameKey)) {
-          throw CustomError.conflict("A service with this name already exists for this business");
+          throw CustomError.conflict("Ya existe un servicio con este nombre en este negocio");
         }
         if (namesInRequest.has(nameKey)) {
           throw CustomError.conflict("Nombre de servicio duplicado en la solicitud");
@@ -116,7 +116,7 @@ export class ServiceService {
         const nameTaken = existingServices.some(
           (s) => s.id !== id && toNameKey(s.name) === nameKey
         );
-        if (nameTaken) throw CustomError.conflict("A service with this name already exists for this business");
+        if (nameTaken) throw CustomError.conflict("Ya existe un servicio con este nombre en este negocio");
       }
 
       if (dto.status === "INACTIVE" && existingService.status !== "INACTIVE") {

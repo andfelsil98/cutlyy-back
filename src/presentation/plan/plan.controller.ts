@@ -9,7 +9,6 @@ import type { PlanService } from "../services/plan.service";
 import { AccessControlService } from "../services/access-control.service";
 import {
   isPlanStatus,
-  PLAN_STATUSES,
   validateCreatePlanDto,
 } from "./dtos/create-plan.dto";
 import { validatePlanIdParam, validateUpdatePlanDto } from "./dtos/update-plan.dto";
@@ -47,7 +46,7 @@ export class PlanController {
 
     if (statusRaw !== undefined && !isPlanStatus(statusRaw)) {
       res.status(400).json({
-        message: `status debe ser uno de: ${PLAN_STATUSES.join(", ")}`,
+        message: "El estado debe ser activo o inactivo",
       });
       return;
     }

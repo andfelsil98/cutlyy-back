@@ -1,11 +1,7 @@
 import { CustomError } from "../../../domain/errors/custom-error";
 import { normalizeSpaces } from "../../../domain/utils/string.utils";
 import {
-  isPlanBillingInterval,
   isPlanStatus,
-  PLAN_BILLING_INTERVALS,
-  PLAN_STATUSES,
-  type PlanBillingInterval,
   type PlanStatus,
 } from "./create-plan.dto";
 
@@ -66,7 +62,7 @@ export function validateUpdatePlanDto(body: unknown): UpdatePlanDto {
   if (b.status !== undefined) {
     if (!isPlanStatus(b.status)) {
       throw CustomError.badRequest(
-        `status debe ser uno de: ${PLAN_STATUSES.join(", ")}`
+        "El estado debe ser activo o inactivo"
       );
     }
     result.status = b.status;

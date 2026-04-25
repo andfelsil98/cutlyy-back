@@ -178,7 +178,7 @@ export class BusinessUsageLimitService {
       );
     }
     if (usageSnapshots.size > 1) {
-      throw CustomError.conflict("Se detectaron múltiples usage ACTIVE para el negocio");
+      throw CustomError.conflict("Se detectaron múltiples registros de uso activos para el negocio");
     }
 
     const usageSnapshot = usageSnapshots.docs[0]!;
@@ -228,7 +228,7 @@ export class BusinessUsageLimitService {
         return;
       }
       if (usageSnapshots.size > 1) {
-        throw CustomError.conflict("Se detectaron múltiples usage ACTIVE para el negocio");
+        throw CustomError.conflict("Se detectaron múltiples registros de uso activos para el negocio");
       }
 
       const usageSnapshot = usageSnapshots.docs[0]!;

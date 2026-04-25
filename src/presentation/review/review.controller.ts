@@ -12,12 +12,12 @@ import { CustomError } from "../../domain/errors/custom-error";
 function parseTargetType(value: unknown): ReviewTargetType | undefined {
   if (value == null) return undefined;
   if (typeof value !== "string") {
-    throw CustomError.badRequest("targetType debe ser EMPLOYEE o BRANCH");
+    throw CustomError.badRequest("El tipo de reseña debe ser empleado o sede");
   }
   const normalized = value.trim().toUpperCase();
   if (normalized === "") return undefined;
   if (normalized !== "EMPLOYEE" && normalized !== "BRANCH") {
-    throw CustomError.badRequest("targetType debe ser EMPLOYEE o BRANCH");
+    throw CustomError.badRequest("El tipo de reseña debe ser empleado o sede");
   }
   return normalized as ReviewTargetType;
 }

@@ -355,7 +355,7 @@ export class AppointmentService {
         );
         if (booking.status !== "CREATED") {
           throw CustomError.badRequest(
-            "Solo se pueden agregar citas a bookings con estado CREATED"
+            "Solo se pueden agregar citas a agendamientos con estado creado"
           );
         }
         if (booking.businessId !== dto.businessId || booking.branchId !== dto.branchId) {
@@ -758,7 +758,7 @@ export class AppointmentService {
         const storedBooking = bookingSnapshot.data() as Booking;
         if (storedBooking.status !== "CREATED") {
           throw CustomError.badRequest(
-            "Solo se pueden agregar citas a bookings con estado CREATED"
+            "Solo se pueden agregar citas a agendamientos con estado creado"
           );
         }
         if (
@@ -1046,7 +1046,7 @@ export class AppointmentService {
       );
       if (booking.status !== "CREATED") {
         throw CustomError.badRequest(
-          "Solo se pueden agregar citas a bookings con estado CREATED"
+          "Solo se pueden agregar citas a agendamientos con estado creado"
         );
       }
 
@@ -1119,7 +1119,7 @@ export class AppointmentService {
         existingAppointment.status === "FINISHED")
     ) {
       throw CustomError.badRequest(
-        "No se puede editar una cita con estado IN_PROGRESS, FINISHED, DELETED o CANCELLED"
+        "No se puede editar una cita con estado en progreso, finalizada, eliminada o cancelada"
       );
     }
 
@@ -1406,7 +1406,7 @@ export class AppointmentService {
           existingAppointment.status === "FINISHED")
       ) {
         throw CustomError.badRequest(
-          "No se puede editar una cita con estado IN_PROGRESS, FINISHED, DELETED o CANCELLED"
+          "No se puede editar una cita con estado en progreso, finalizada, eliminada o cancelada"
         );
       }
 
@@ -2791,7 +2791,7 @@ export class AppointmentService {
 
     if (!isValidEmployee) {
       throw CustomError.badRequest(
-        "employeeId debe pertenecer a una membresía ACTIVE con isEmployee=true en este negocio"
+        "El empleado debe tener una membresía activa y estar marcado como empleado en este negocio"
       );
     }
   }

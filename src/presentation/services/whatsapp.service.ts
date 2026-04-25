@@ -34,13 +34,13 @@ export class WhatsAppService {
 
     if (templateName === "") {
       throw CustomError.internalServerError(
-        `Plantilla de WhatsApp inválida para ${params.templateType}: templateName vacío`
+        "Configuración inválida de plantilla de WhatsApp"
       );
     }
 
     if (language === "") {
       throw CustomError.internalServerError(
-        `Plantilla de WhatsApp inválida para ${params.templateType}: language vacío`
+        "Configuración inválida de plantilla de WhatsApp"
       );
     }
 
