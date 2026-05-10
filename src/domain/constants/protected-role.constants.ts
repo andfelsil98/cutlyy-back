@@ -97,3 +97,21 @@ export function isAdminProtectedRole(
 ): boolean {
   return resolveProtectedRoleDefinition(input)?.key === "ADMIN";
 }
+
+export function isSuperAdminProtectedRole(
+  input: {
+    id?: string | null;
+    name?: string | null;
+    type?: RoleType | null;
+  } | null | undefined
+): boolean {
+  return resolveProtectedRoleDefinition(input)?.key === "SUPER_ADMIN";
+}
+
+export const PROTECTED_SUPER_ADMIN_USER_ID = "Jgz2gwvgdfJBoa28bzGZ";
+
+export function isProtectedSuperAdminUserId(
+  userId: string | null | undefined
+): boolean {
+  return typeof userId === "string" && userId.trim() === PROTECTED_SUPER_ADMIN_USER_ID;
+}

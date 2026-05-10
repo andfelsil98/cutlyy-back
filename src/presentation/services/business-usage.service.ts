@@ -41,7 +41,10 @@ function clampAvailable(limit: number, currentCount: number): number {
 }
 
 export class BusinessUsageService {
-  async ensurePlanExists(planId: string): Promise<Plan> {
+  async ensurePlanExists(
+    planId: string,
+    options: { requireActive?: boolean } = {}
+  ): Promise<Plan> {
     const normalizedPlanId = planId.trim();
     if (normalizedPlanId === "") {
       throw CustomError.badRequest("planId es requerido");
@@ -57,6 +60,11 @@ export class BusinessUsageService {
     }
 
     const data = plan.data() as Plan & { billingInterval?: Plan["billingInterval"] | "QUATERLY" };
+
+    if (options.requireActive === true && data.status !== "ACTIVE") {
+      throw CustomError.conflict("El plan seleccionado no está activo");
+    }
+
     return {
       ...data,
       id: plan.id,

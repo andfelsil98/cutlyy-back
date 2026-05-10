@@ -1,5 +1,6 @@
 import { FirestoreDataBase } from "../../data/firestore/firestore.database";
 import {
+  isAdminOnlyBusinessPermissionValue,
   isBusinessRoleType,
   isGlobalRoleType,
   type RoleType,
@@ -17,7 +18,10 @@ import {
   buildPagination,
   MAX_PAGE_SIZE,
 } from "../../domain/interfaces/pagination.interface";
-import { resolveProtectedRoleDefinition } from "../../domain/constants/protected-role.constants";
+import {
+  isAdminProtectedRole,
+  resolveProtectedRoleDefinition,
+} from "../../domain/constants/protected-role.constants";
 import { BusinessUsageLimitService } from "./business-usage-limit.service";
 import FirestoreService from "./firestore.service";
 import type { CreateRoleDto } from "../role/dtos/create-role.dto";
@@ -186,7 +190,7 @@ export class RoleService {
         }
         resolvedPermissions.push(permissions[0]!);
       }
-      this.ensurePermissionsCompatibleWithRoleType(dto.type, resolvedPermissions);
+      this.ensurePermissionsAllowedForRole(dto, resolvedPermissions);
 
       if (dto.type === "BUSINESS") {
         await this.businessUsageLimitService.consume(dto.businessId!, "roles", 1);
@@ -306,9 +310,7 @@ export class RoleService {
                 `El rol ya tiene asociado el permiso ${operation.permission.id}`
               );
             }
-            this.ensurePermissionsCompatibleWithRoleType(role.type, [
-              operation.permission,
-            ]);
+            this.ensurePermissionsAllowedForRole(role, [operation.permission]);
             await FirestoreService.createInSubcollection(
               COLLECTION_NAME,
               role.id,
@@ -428,6 +430,25 @@ export class RoleService {
     }
 
     return resolved;
+  }
+
+  private ensurePermissionsAllowedForRole(
+    role: { id?: string | null; name?: string | null; type: RoleType },
+    permissions: Permission[]
+  ): void {
+    this.ensurePermissionsCompatibleWithRoleType(role.type, permissions);
+
+    const invalidAdminOnlyPermission = permissions.find(
+      (permission) =>
+        isBusinessRoleType(role.type) &&
+        isAdminOnlyBusinessPermissionValue(permission.value) &&
+        !isAdminProtectedRole(role)
+    );
+    if (invalidAdminOnlyPermission) {
+      throw CustomError.badRequest(
+        `El permiso ${invalidAdminOnlyPermission.id} solo puede asignarse al rol administrador estándar en negocios`
+      );
+    }
   }
 
   private ensurePermissionsCompatibleWithRoleType(

@@ -33,8 +33,6 @@ export const GLOBAL_PERMISSION_VALUES = new Set([
   "core.plans.edit",
   "core.plans.delete",
   "core.plans.list",
-  "core.memberships.create",
-  "core.users.delete",
   "core.permissions.create",
   "core.permissions.edit",
   "core.permissions.delete",
@@ -47,6 +45,9 @@ export const HYBRID_PERMISSION_VALUES = new Set([
   "core.users.list",
   "core.users.activateOrDeactivate",
   "core.users.changeRole",
+  "core.users.delete",
+  "core.memberships.create",
+  "core.memberships.delete",
   "core.roles.list",
   "core.roles.detail",
   "core.roles.create",
@@ -54,6 +55,10 @@ export const HYBRID_PERMISSION_VALUES = new Set([
   "core.roles.delete",
   "core.permissions.list",
   "core.modules.list",
+]);
+
+export const ADMIN_ONLY_BUSINESS_PERMISSION_VALUES = new Set([
+  "core.users.delete",
 ]);
 
 export const DEFAULT_CROSS_BUSINESS_ADMIN_ROLE_NAME = "Super admin";
@@ -75,4 +80,8 @@ export function isBusinessRoleType(type: RoleType): boolean {
 
 export function isGlobalRoleType(type: RoleType): boolean {
   return type === "GLOBAL";
+}
+
+export function isAdminOnlyBusinessPermissionValue(value: string): boolean {
+  return ADMIN_ONLY_BUSINESS_PERMISSION_VALUES.has(value.trim());
 }

@@ -2,6 +2,7 @@ import { FirestoreDataBase } from "../../data/firestore/firestore.database";
 import { randomInt } from "node:crypto";
 import { FieldValue } from "firebase-admin/firestore";
 import {
+  isAdminOnlyBusinessPermissionValue,
   type AccessEntityType,
   type RoleType,
 } from "../../domain/constants/access-control.constants";
@@ -252,7 +253,7 @@ export class BusinessService {
     let createdBusinessSlug: string | null = null;
 
     try {
-      await this.businessUsageService.ensurePlanExists(dto.planId);
+      await this.businessUsageService.ensurePlanExists(dto.planId, { requireActive: true });
 
       const businessWithSameConsecutivePrefix = await FirestoreService.getAll<Business>(
         COLLECTION_NAME,
@@ -326,7 +327,10 @@ export class BusinessService {
       const currentBusiness = await FirestoreService.getById<BusinessRecord>(COLLECTION_NAME, id);
 
       if (dto.planId !== undefined) {
-        await this.businessUsageService.ensurePlanExists(dto.planId);
+        const planChanged = dto.planId !== currentBusiness.planId;
+        await this.businessUsageService.ensurePlanExists(dto.planId, {
+          requireActive: planChanged,
+        });
       }
 
       if (dto.consecutivePrefix !== undefined) {
@@ -1140,9 +1144,7 @@ export class BusinessService {
       PERMISSIONS_COLLECTION
     );
     const compatiblePermissions = permissions.filter((permission) =>
-      definition.compatiblePermissionTypes.includes(
-        permission.type as AccessEntityType
-      )
+      this.isPermissionAllowedForProtectedRole(permission, definition)
     );
 
     const currentPermissions = await FirestoreService.getAllFromSubcollection<{
@@ -1190,6 +1192,22 @@ export class BusinessService {
     }
 
     return await FirestoreService.getById<Role>(ROLES_COLLECTION, role.id);
+  }
+
+  private isPermissionAllowedForProtectedRole(
+    permission: Permission,
+    definition: ProtectedRoleDefinition
+  ): boolean {
+    const permissionType = permission.type as AccessEntityType;
+    if (!definition.compatiblePermissionTypes.includes(permissionType)) {
+      return false;
+    }
+
+    if (!isAdminOnlyBusinessPermissionValue(permission.value)) {
+      return true;
+    }
+
+    return definition.type === "GLOBAL" || definition.key === "ADMIN";
   }
 
   private async markMembershipsAsInactiveByBusiness(

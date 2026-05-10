@@ -24,6 +24,7 @@ export class BusinessMembershipRoutes {
       "/create-by-document",
       businessMembershipController.createPendingByDocument
     );
+    router.patch("/:id/delete", businessMembershipController.deleteMembership);
     router.patch("/:id/toggle-status", businessMembershipController.toggleStatus);
     router.patch("/:id/toggle-employee", businessMembershipController.toggleEmployee);
     router.post("/assign-role", businessMembershipController.assignRole);

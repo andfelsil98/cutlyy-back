@@ -113,6 +113,26 @@ export class PlanController {
     }
   };
 
+  public getStatusChangeEligibility = (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => {
+    try {
+      const document = this.getRequesterDocument(req);
+      const id = validatePlanIdParam(req.params.id);
+      this.accessControlService
+        .requireGlobalPermission(document, "core.plan.edit")
+        .then(() => this.planService.getStatusChangeEligibility(id))
+        .then((result) => {
+          res.status(200).json(result);
+        })
+        .catch(next);
+    } catch (error) {
+      next(error);
+    }
+  };
+
   private getRequesterDocument(req: Request): string {
     const document = req.decodedIdToken?.["document"];
     if (typeof document !== "string" || document.trim() === "") {

@@ -8,6 +8,7 @@ import type { UserService } from "../services/user.service";
 import { CustomError } from "../../domain/errors/custom-error";
 import { validateUpdateUserDto, validateUserIdParam } from "./dtos/update-user.dto";
 import { AccessControlService } from "../services/access-control.service";
+import { isAdminProtectedRole } from "../../domain/constants/protected-role.constants";
 
 export class UsersController {
   constructor(
@@ -134,9 +135,30 @@ export class UsersController {
       ...(deletedByEmail != null && { deletedByEmail }),
     };
 
-    this.accessControlService
-      .requireGlobalPermission(requesterDocument, "core.users.delete")
-      .then(() => this.userService.deleteUser(document, deleteOpts))
+    const execute = async () => {
+      const businessId = req.businessId?.trim() ?? "";
+      if (businessId !== "") {
+        const accessContext = await this.accessControlService.requireBusinessPermission(
+          requesterDocument,
+          businessId,
+          "core.users.delete"
+        );
+        if (!isAdminProtectedRole(accessContext.role)) {
+          throw CustomError.forbidden(
+            "Solo el rol administrador estándar puede eliminar usuarios desde un negocio."
+          );
+        }
+      } else {
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.users.delete"
+        );
+      }
+
+      return this.userService.deleteUser(document, deleteOpts);
+    };
+
+    execute()
       .then((result) => {
         res.status(200).json(result);
       })

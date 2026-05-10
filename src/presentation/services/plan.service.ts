@@ -3,9 +3,10 @@ import { CustomError } from "../../domain/errors/custom-error";
 import type { PaginatedResult, PaginationParams } from "../../domain/interfaces/pagination.interface";
 import { MAX_PAGE_SIZE } from "../../domain/interfaces/pagination.interface";
 import type { Plan } from "../../domain/interfaces/plan.interface";
-import { normalizeBillingInterval } from "../../domain/utils/usage-period.utils";
+import { getCurrentBogotaDate, normalizeBillingInterval } from "../../domain/utils/usage-period.utils";
 import type { CreatePlanDto } from "../plan/dtos/create-plan.dto";
 import type { UpdatePlanDto } from "../plan/dtos/update-plan.dto";
+import { BusinessUsageService } from "./business-usage.service";
 import FirestoreService from "./firestore.service";
 
 const COLLECTION_NAME = "Plans";
@@ -16,6 +17,10 @@ function toNameKey(value: string): string {
 }
 
 export class PlanService {
+  constructor(
+    private readonly businessUsageService: BusinessUsageService = new BusinessUsageService()
+  ) {}
+
   async getAllPlans(
     params: PaginationParams & { id?: string; status?: Plan["status"] }
   ): Promise<PaginatedResult<Plan>> {
@@ -82,6 +87,19 @@ export class PlanService {
         await this.ensureNameAvailable(dto.name, id);
       }
 
+      if (dto.status !== undefined && dto.status !== plans[0]!.status) {
+        const blockingBusinessCount = await this.findBusinessesBlockingStatusChange(id);
+        if (blockingBusinessCount > 0) {
+          throw CustomError.conflict(
+            `No se puede cambiar el estado del plan porque hay ${blockingBusinessCount} ${
+              blockingBusinessCount === 1 ? "negocio" : "negocios"
+            } con vigencia activa o futura asociad${
+              blockingBusinessCount === 1 ? "o" : "os"
+            } a este plan`
+          );
+        }
+      }
+
       const payload: Record<string, unknown> = {
         updatedAt: FirestoreDataBase.generateTimeStamp(),
       };
@@ -102,6 +120,52 @@ export class PlanService {
       if (error instanceof CustomError) throw error;
       throw CustomError.internalServerError("Error interno del servidor");
     }
+  }
+
+  async getStatusChangeEligibility(
+    id: string
+  ): Promise<{ canChangeStatus: boolean; blockingBusinessCount: number }> {
+    try {
+      const plans = await FirestoreService.getAll<Plan>(COLLECTION_NAME, [
+        { field: "id", operator: "==", value: id },
+      ]);
+      if (plans.length === 0) {
+        throw CustomError.notFound("No existe un plan con este id");
+      }
+
+      const blockingBusinessCount = await this.findBusinessesBlockingStatusChange(id);
+      return {
+        canChangeStatus: blockingBusinessCount === 0,
+        blockingBusinessCount,
+      };
+    } catch (error) {
+      if (error instanceof CustomError) throw error;
+      throw CustomError.internalServerError("Error interno del servidor");
+    }
+  }
+
+  private async findBusinessesBlockingStatusChange(planId: string): Promise<number> {
+    const businessesUsingPlan = await FirestoreService.getAll<{
+      id: string;
+      status: string;
+    }>(BUSINESS_COLLECTION, [
+      { field: "planId", operator: "==", value: planId },
+    ]);
+    const today = getCurrentBogotaDate();
+    let blockingCount = 0;
+
+    for (const business of businessesUsingPlan) {
+      if (business.status === "DELETED") continue;
+      const usages = await this.businessUsageService.getUsages(business.id);
+      const hasActiveOrFuturePeriod = usages.some(
+        (usage) => usage.endPeriod >= today || usage.startPeriod > today
+      );
+      if (hasActiveOrFuturePeriod) {
+        blockingCount += 1;
+      }
+    }
+
+    return blockingCount;
   }
 
   async deletePlan(id: string): Promise<{ id: string; message: string }> {

@@ -10,6 +10,7 @@ export class PlanRoutes {
     const planController = new PlanController(planService);
 
     router.get("/", planController.getAll);
+    router.get("/:id/status-change-eligibility", planController.getStatusChangeEligibility);
     router.post("/", planController.create);
     router.put("/:id", planController.update);
     router.delete("/:id", planController.deletePlan);

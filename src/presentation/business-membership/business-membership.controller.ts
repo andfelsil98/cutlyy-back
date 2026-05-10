@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import type { BusinessMembershipService } from "../services/business-membership.service";
+import type { BusinessMembership } from "../../domain/interfaces/business-membership.interface";
 import { CustomError } from "../../domain/errors/custom-error";
 import {
   validateAssignBranchDto,
@@ -37,13 +38,11 @@ export class BusinessMembershipController {
 
   private async requireScopedMembershipPermission(
     req: Request,
-    membership: {
-      id: string;
-      businessId?: string | null;
-    },
+    membership: BusinessMembership,
     input: {
       globalPermission: string;
       businessPermission: string;
+      allowSuperAdminSelfOverride?: boolean;
     }
   ) {
     const requesterDocument = this.getRequesterDocument(req);
@@ -54,6 +53,19 @@ export class BusinessMembershipController {
         requesterDocument,
         input.globalPermission
       );
+      return {
+        requesterDocument,
+        businessId: "",
+      };
+    }
+
+    if (
+      input.allowSuperAdminSelfOverride !== false &&
+      await this.businessMembershipService.canUseSuperAdminSelfMembershipOverride(
+        requesterDocument,
+        membership
+      )
+    ) {
       return {
         requesterDocument,
         businessId: "",
@@ -256,6 +268,30 @@ export class BusinessMembershipController {
       .catch(next);
   };
 
+  public deleteMembership = (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => {
+    const id = validateMembershipIdParam(req.params.id);
+    const execute = async () => {
+      const membership = await this.businessMembershipService.getById(id);
+      await this.requireScopedMembershipPermission(req, membership, {
+        globalPermission: "core.memberships.delete",
+        businessPermission: "core.memberships.delete",
+        allowSuperAdminSelfOverride: false,
+      });
+
+      return this.businessMembershipService.deleteMembership(id);
+    };
+
+    execute()
+      .then((membership) => {
+        res.status(200).json(membership);
+      })
+      .catch(next);
+  };
+
   public toggleEmployee = (req: Request, res: Response, next: NextFunction) => {
     const id = validateMembershipIdParam(req.params.id);
     const execute = async () => {
@@ -337,26 +373,45 @@ export class BusinessMembershipController {
     res: Response,
     next: NextFunction
   ) => {
-    try {
+    const execute = async () => {
       const requesterDocument = this.getRequesterDocument(req);
-      void this.accessControlService
-        .requireGlobalPermission(
+      const dto = validateCreatePendingMembershipByDocumentDto(req.body);
+      const targetBusinessId = dto.businessId?.trim() ?? "";
+
+      if (targetBusinessId === "") {
+        await this.accessControlService.requireGlobalPermission(
           requesterDocument,
           "core.memberships.create"
-        )
-        .then(() => {
-          const dto = validateCreatePendingMembershipByDocumentDto(req.body);
+        );
+      } else {
+        const businessIdHeader = req.businessId?.trim() ?? "";
+        if (businessIdHeader === "") {
+          throw CustomError.badRequest(
+            "Se requiere el header businessId para asociar un usuario a un negocio."
+          );
+        }
+        if (businessIdHeader !== targetBusinessId) {
+          throw CustomError.badRequest(
+            "El businessId del header no coincide con el negocio indicado."
+          );
+        }
 
-          this.businessMembershipService
-            .createPendingByDocument(dto)
-            .then((membership) => {
-              res.status(201).json(membership);
-            })
-            .catch(next);
-        })
-        .catch(next);
-    } catch (error) {
-      next(error);
-    }
+        await this.accessControlService.requireBusinessPermission(
+          requesterDocument,
+          targetBusinessId,
+          "core.memberships.create"
+        );
+      }
+
+      return this.businessMembershipService.createPendingByDocument(dto, {
+        requesterDocument,
+      });
+    };
+
+    execute()
+      .then((result) => {
+        res.status(201).json(result);
+      })
+      .catch(next);
   };
 }

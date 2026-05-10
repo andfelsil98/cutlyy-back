@@ -14,15 +14,23 @@ import {
 } from "../../domain/interfaces/business-membership.interface";
 import type { Role } from "../../domain/interfaces/role.interface";
 import type { User } from "../../domain/interfaces/user.interface";
+import type { Appointment } from "../../domain/interfaces/appointment.interface";
 import {
   buildPagination,
   type PaginatedResult,
   type PaginationParams,
   MAX_PAGE_SIZE,
 } from "../../domain/interfaces/pagination.interface";
-import { isAdminProtectedRole } from "../../domain/constants/protected-role.constants";
+import {
+  getProtectedRoleDefinition,
+  isAdminProtectedRole,
+  isProtectedSuperAdminUserId,
+  isSuperAdminProtectedRole,
+} from "../../domain/constants/protected-role.constants";
 import { BusinessUsageLimitService } from "./business-usage-limit.service";
 import FirestoreService from "./firestore.service";
+import { MetricService } from "./metric.service";
+import { ReviewService } from "./review.service";
 import { RoleService } from "./role.service";
 import { SchedulingIntegrityService } from "./scheduling-integrity.service";
 import { UserService } from "./user.service";
@@ -30,6 +38,7 @@ import { UserService } from "./user.service";
 const COLLECTION_NAME = "BusinessMemberships";
 const BUSINESSES_COLLECTION = "Businesses";
 const BRANCHES_COLLECTION = "Branches";
+const APPOINTMENTS_COLLECTION = "Appointments";
 const ROLE_COLLECTION = "Roles";
 const USER_COLLECTION = "Users";
 
@@ -41,6 +50,10 @@ export interface CreateBusinessMembershipData {
 export interface CreatePendingMembershipByDocumentData {
   businessId?: string;
   document: string;
+}
+
+export interface CreatePendingMembershipByDocumentOptions {
+  requesterDocument?: string;
 }
 
 export type BusinessMembershipWithRelations = Omit<
@@ -58,7 +71,9 @@ export class BusinessMembershipService {
     private readonly schedulingIntegrityService: SchedulingIntegrityService =
       new SchedulingIntegrityService(),
     private readonly businessUsageLimitService: BusinessUsageLimitService =
-      new BusinessUsageLimitService()
+      new BusinessUsageLimitService(),
+    private readonly reviewService: ReviewService = new ReviewService(),
+    private readonly metricService: MetricService = new MetricService()
   ) {}
 
   async getAllMemberships(
@@ -376,21 +391,28 @@ export class BusinessMembershipService {
   }
 
   async createPendingByDocument(
-    data: CreatePendingMembershipByDocumentData
+    data: CreatePendingMembershipByDocumentData,
+    opts: CreatePendingMembershipByDocumentOptions = {}
   ): Promise<BusinessMembership> {
     try {
       const document = data.document.trim();
       const explicitBusinessId = data.businessId?.trim() ?? "";
+      const requesterDocument = opts.requesterDocument?.trim() ?? "";
 
       const user = await this.findUserByDocument(document);
+      const now = FirestoreDataBase.generateTimeStamp();
 
       if (!user) {
-        throw CustomError.notFound(
-          "No existe un usuario con este número de documento"
-        );
+        return this.normalizeMembership({
+          id: "",
+          businessId: explicitBusinessId !== "" ? explicitBusinessId : null,
+          userId: "",
+          isEmployee: false,
+          roleId: null,
+          status: "PENDING",
+          createdAt: now,
+        } as unknown as BusinessMembership);
       }
-
-      const now = FirestoreDataBase.generateTimeStamp();
       const businessId = explicitBusinessId;
       if (businessId !== "") {
         const business = await this.getBusinessById(businessId);
@@ -414,6 +436,18 @@ export class BusinessMembershipService {
           );
         }
 
+        const canRecoverOrphanedBusiness =
+          requesterDocument !== "" &&
+          user.document.trim() === requesterDocument &&
+          (await this.isRequesterGlobalSuperAdmin(requesterDocument)) &&
+          (await this.isBusinessOrphaned(businessId));
+        const adminRole = canRecoverOrphanedBusiness
+          ? await this.resolveProtectedAdminRole()
+          : null;
+        const nextRoleId = adminRole?.id ?? null;
+        const nextStatus = canRecoverOrphanedBusiness
+          ? ("ACTIVE" as const)
+          : ("PENDING" as const);
         const reusableMembership = existingMemberships[0] ?? null;
         const membershipId = reusableMembership?.id;
 
@@ -422,8 +456,8 @@ export class BusinessMembershipService {
             businessId,
             userId: user.document,
             isEmployee: false,
-            roleId: null,
-            status: "PENDING" as const,
+            roleId: nextRoleId,
+            status: nextStatus,
             branchId: FieldValue.delete(),
             deletedAt: null,
             updatedAt: now,
@@ -433,8 +467,8 @@ export class BusinessMembershipService {
             businessId,
             userId: user.document,
             isEmployee: false,
-            roleId: null as string | null,
-            status: "PENDING" as const,
+            roleId: nextRoleId,
+            status: nextStatus,
             createdAt: now,
           });
 
@@ -507,6 +541,46 @@ export class BusinessMembershipService {
     return this.getMembershipById(id);
   }
 
+  async canUseSuperAdminSelfMembershipOverride(
+    requesterDocument: string,
+    membership: BusinessMembership
+  ): Promise<boolean> {
+    const normalizedRequesterDocument = requesterDocument.trim();
+    const targetBusinessId = membership.businessId?.trim() ?? "";
+    if (normalizedRequesterDocument === "" || targetBusinessId === "") return false;
+
+    const requesterUser = await this.findUserByDocument(normalizedRequesterDocument);
+    if (!requesterUser) return false;
+    if (!this.membershipBelongsToUser(membership, requesterUser)) return false;
+
+    return await this.isRequesterGlobalSuperAdmin(normalizedRequesterDocument);
+  }
+
+  private async ensureMembershipIsNotProtectedSuperAdmin(
+    membership: BusinessMembership,
+    action: "delete" | "deactivate" | "changeRole",
+    nextRole?: Role | null
+  ): Promise<void> {
+    const user = await this.resolveMembershipUser(membership.userId).catch(() => null);
+    const targetUserId = user?.id?.trim() ?? "";
+    if (!isProtectedSuperAdminUserId(targetUserId)) return;
+
+    const roleId = membership.roleId?.trim() ?? "";
+    if (roleId === "") return;
+    const currentRole = await this.getRoleById(roleId);
+    if (!isSuperAdminProtectedRole(currentRole)) return;
+
+    if (action === "changeRole" && isSuperAdminProtectedRole(nextRole ?? null)) return;
+
+    const message =
+      action === "delete"
+        ? "No se puede eliminar la membresía del super administrador protegido."
+        : action === "deactivate"
+          ? "No se puede inactivar la membresía del super administrador protegido."
+          : "No se puede cambiar el rol de la membresía del super administrador protegido.";
+    throw CustomError.forbidden(message);
+  }
+
   async toggleStatus(id: string): Promise<BusinessMembership> {
     try {
       const membership = await this.getMembershipById(id);
@@ -538,13 +612,7 @@ export class BusinessMembershipService {
           );
         }
       } else {
-        await this.ensureBusinessRetainsAdminMembership({
-          membership,
-          nextStatus: newStatus,
-          errorMessage:
-            "Cada negocio debe tener al menos una persona activa con el rol administrador. No puedes inactivar al único administrador del negocio.",
-        });
-
+        await this.ensureMembershipIsNotProtectedSuperAdmin(membership, "deactivate");
         if (membership.isEmployee === true) {
           const employeeIdentifiers = await this.resolveMembershipUserIdentifiers(
             membership.userId
@@ -560,6 +628,94 @@ export class BusinessMembershipService {
         updatedAt: FirestoreDataBase.generateTimeStamp(),
       };
       await FirestoreService.update(COLLECTION_NAME, id, payload);
+      return await this.getMembershipById(id);
+    } catch (error) {
+      if (error instanceof CustomError) throw error;
+      throw CustomError.internalServerError("Error interno del servidor");
+    }
+  }
+
+  async deleteMembership(id: string): Promise<BusinessMembership> {
+    try {
+      const membership = await this.getMembershipById(id);
+
+      if (membership.status === "DELETED") {
+        throw CustomError.badRequest("La membresía ya está eliminada");
+      }
+
+      await this.ensureMembershipIsNotProtectedSuperAdmin(membership, "delete");
+
+      const user = await this.resolveMembershipUser(membership.userId);
+      const targetBusinessId = membership.businessId?.trim() ?? "";
+      const employeeIdentifiers = Array.from(
+        new Set([user.document.trim(), user.id.trim()].filter((value) => value !== ""))
+      );
+      const deletedAt = FirestoreDataBase.generateTimeStamp();
+
+      let shouldReleaseEmployeeQuota = false;
+      let nextEmployees: string[] | null = null;
+
+      if (targetBusinessId !== "") {
+        await this.ensureEmployeeHasNoActiveAppointmentsInBusiness(
+          targetBusinessId,
+          employeeIdentifiers
+        );
+
+        await this.reviewService.deleteEmployeeReviewsByBusinessAndTargetIds(
+          targetBusinessId,
+          employeeIdentifiers
+        );
+        await this.metricService.deleteEmployeeMetricsByBusinessAndEmployeeIds(
+          targetBusinessId,
+          employeeIdentifiers
+        );
+
+        const business = await FirestoreService.getById<Business>(
+          BUSINESSES_COLLECTION,
+          targetBusinessId
+        );
+        const currentEmployees = this.normalizeEmployeesList(business.employees);
+        const cleanedEmployees = this.removeEmployeesFromList(
+          business.employees,
+          employeeIdentifiers
+        );
+        if (!this.areStringListsEqual(currentEmployees, cleanedEmployees)) {
+          nextEmployees = cleanedEmployees;
+        }
+        shouldReleaseEmployeeQuota = membership.isEmployee === true;
+      }
+
+      const db = FirestoreDataBase.getDB();
+      const batch = db.batch();
+      batch.update(db.collection(COLLECTION_NAME).doc(id), {
+        status: "DELETED" as const,
+        isEmployee: false,
+        branchId: FieldValue.delete(),
+        deletedAt,
+        updatedAt: deletedAt,
+      });
+      if (targetBusinessId !== "" && nextEmployees != null) {
+        batch.update(db.collection(BUSINESSES_COLLECTION).doc(targetBusinessId), {
+          employees: nextEmployees,
+          updatedAt: deletedAt,
+        });
+      }
+      batch.delete(
+        db.collection(USER_COLLECTION)
+          .doc(user.id)
+          .collection("businessMemberships")
+          .doc(id)
+      );
+      await batch.commit();
+
+      if (shouldReleaseEmployeeQuota) {
+        await this.businessUsageLimitService.release(
+          targetBusinessId,
+          "employees",
+          1
+        );
+      }
+
       return await this.getMembershipById(id);
     } catch (error) {
       if (error instanceof CustomError) throw error;
@@ -668,7 +824,13 @@ export class BusinessMembershipService {
       const requesterDocument = opts.requesterDocument.trim();
 
       const targetBusinessId = targetMembership.businessId?.trim() ?? "";
-      if (targetBusinessId !== "") {
+      const usesSuperAdminSelfOverride =
+        targetBusinessId !== "" &&
+        (await this.canUseSuperAdminSelfMembershipOverride(
+          requesterDocument,
+          targetMembership
+        ));
+      if (targetBusinessId !== "" && !usesSuperAdminSelfOverride) {
         if (targetBusinessId !== businessId) {
           throw CustomError.badRequest(
             "El businessId del header no coincide con la membresía a modificar"
@@ -695,13 +857,11 @@ export class BusinessMembershipService {
       }
       const role = roles[0]!;
 
-      await this.ensureBusinessRetainsAdminMembership({
-        membership: targetMembership,
-        nextRole: role,
-        nextStatus: targetMembership.status,
-        errorMessage:
-          "Cada negocio debe tener al menos una persona activa con el rol administrador. No puedes cambiar el rol del único administrador del negocio.",
-      });
+      await this.ensureMembershipIsNotProtectedSuperAdmin(
+        targetMembership,
+        "changeRole",
+        role
+      );
 
       if (targetBusinessId === "") {
         if (!isGlobalRoleType(role.type)) {
@@ -853,43 +1013,70 @@ export class BusinessMembershipService {
     return roles[0] ?? null;
   }
 
-  private async ensureBusinessRetainsAdminMembership(input: {
-    membership: BusinessMembership;
-    nextRole?: Role | null;
-    nextStatus: BusinessMembership["status"];
-    errorMessage: string;
-  }): Promise<void> {
-    const businessId = input.membership.businessId?.trim() ?? "";
-    if (businessId === "") return;
-    if (input.membership.status !== "ACTIVE") return;
+  private async resolveProtectedAdminRole(): Promise<Role> {
+    const definition = getProtectedRoleDefinition("ADMIN");
+    const roleById = await this.getRoleById(definition.id);
+    if (roleById) return roleById;
 
-    const currentRoleId = input.membership.roleId?.trim() ?? "";
-    if (currentRoleId === "") return;
+    const rolesByType = await FirestoreService.getAll<Role>(ROLE_COLLECTION, [
+      { field: "type", operator: "==", value: definition.type },
+    ]);
+    const roleByDefinition = rolesByType.find((role) => isAdminProtectedRole(role));
+    if (roleByDefinition) return roleByDefinition;
 
-    const currentRole = await this.getRoleById(currentRoleId);
-    if (!currentRole || !isAdminProtectedRole(currentRole)) return;
+    throw CustomError.internalServerError(
+      "No se pudo resolver el rol administrador estándar"
+    );
+  }
 
-    const willRemainAdmin =
-      input.nextStatus === "ACTIVE" &&
-      input.nextRole != null &&
-      isAdminProtectedRole(input.nextRole);
-    if (willRemainAdmin) return;
-
-    const activeAdminMemberships = await FirestoreService.getAll<BusinessMembership>(
+  private async isBusinessOrphaned(businessId: string): Promise<boolean> {
+    const activeMemberships = await FirestoreService.getAll<BusinessMembership>(
       COLLECTION_NAME,
       [
         { field: "businessId", operator: "==", value: businessId },
-        { field: "roleId", operator: "==", value: currentRole.id },
         { field: "status", operator: "==", value: "ACTIVE" },
       ]
     );
 
-    const hasAnotherActiveAdmin = activeAdminMemberships.some(
-      (membership) => membership.id !== input.membership.id
-    );
-    if (!hasAnotherActiveAdmin) {
-      throw CustomError.badRequest(input.errorMessage);
+    for (const membership of activeMemberships) {
+      const roleId = membership.roleId?.trim() ?? "";
+      if (roleId === "") continue;
+
+      const role = await this.getRoleById(roleId);
+      if (isAdminProtectedRole(role)) return false;
     }
+
+    return true;
+  }
+
+  private async isRequesterGlobalSuperAdmin(
+    requesterDocument: string
+  ): Promise<boolean> {
+    const requesterUser = await this.findUserByDocument(requesterDocument);
+    if (!requesterUser) return false;
+
+    const globalMemberships = await this.getGlobalMembershipsByUser(requesterUser);
+    for (const membership of globalMemberships) {
+      if (membership.status !== "ACTIVE") continue;
+
+      const roleId = membership.roleId?.trim() ?? "";
+      if (roleId === "") continue;
+
+      const role = await this.getRoleById(roleId);
+      if (isSuperAdminProtectedRole(role)) return true;
+    }
+
+    return false;
+  }
+
+  private membershipBelongsToUser(
+    membership: BusinessMembership,
+    user: User
+  ): boolean {
+    const membershipUserId = membership.userId.trim();
+    if (membershipUserId === "") return false;
+
+    return membershipUserId === user.document.trim() || membershipUserId === user.id.trim();
   }
 
   private async resolveMembershipUser(membershipUserId: string): Promise<User> {
@@ -937,6 +1124,44 @@ export class BusinessMembershipService {
     );
   }
 
+  private async ensureEmployeeHasNoActiveAppointmentsInBusiness(
+    businessId: string,
+    employeeIdentifiers: string[]
+  ): Promise<void> {
+    const normalizedBusinessId = businessId.trim();
+    const normalizedIdentifiers = Array.from(
+      new Set(
+        employeeIdentifiers
+          .map((identifier) => identifier.trim())
+          .filter((identifier) => identifier !== "")
+      )
+    );
+    if (normalizedBusinessId === "" || normalizedIdentifiers.length === 0) {
+      throw CustomError.badRequest("businessId y employeeId son requeridos");
+    }
+
+    const activeAppointmentResults = await Promise.all(
+      normalizedIdentifiers.map((employeeId) =>
+        FirestoreService.getAll<Appointment>(
+          APPOINTMENTS_COLLECTION,
+          [
+            { field: "businessId", operator: "==", value: normalizedBusinessId },
+            { field: "employeeId", operator: "==", value: employeeId },
+            { field: "status", operator: "in", value: ["CREATED", "IN_PROGRESS"] },
+          ],
+          undefined,
+          ["id"]
+        )
+      )
+    );
+
+    if (activeAppointmentResults.some((appointments) => appointments.length > 0)) {
+      throw CustomError.badRequest(
+        "No se puede eliminar la membresía porque el usuario está asociado a citas activas como empleado en este negocio"
+      );
+    }
+  }
+
   private buildNextEmployeesList(
     currentEmployees: string[] | undefined,
     userDocument: string,
@@ -954,6 +1179,34 @@ export class BusinessMembershipService {
     }
 
     return Array.from(employeesSet);
+  }
+
+  private removeEmployeesFromList(
+    currentEmployees: string[] | undefined,
+    employeeIdentifiers: string[]
+  ): string[] {
+    const identifiersSet = new Set(
+      employeeIdentifiers
+        .map((identifier) => identifier.trim())
+        .filter((identifier) => identifier !== "")
+    );
+
+    return (currentEmployees ?? [])
+      .map((employeeDocument) => employeeDocument.trim())
+      .filter(
+        (employeeDocument) =>
+          employeeDocument !== "" && !identifiersSet.has(employeeDocument)
+      );
+  }
+
+  private normalizeEmployeesList(currentEmployees: string[] | undefined): string[] {
+    return (currentEmployees ?? [])
+      .map((employeeDocument) => employeeDocument.trim())
+      .filter((employeeDocument) => employeeDocument !== "");
+  }
+
+  private areStringListsEqual(left: string[], right: string[]): boolean {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
   }
 
   private async getBusinessById(businessId: string): Promise<Business> {

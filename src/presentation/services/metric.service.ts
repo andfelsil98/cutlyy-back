@@ -123,6 +123,39 @@ export class MetricService {
     );
   }
 
+  async deleteEmployeeMetricsByBusinessAndEmployeeIds(
+    businessId: string,
+    employeeIds: string[]
+  ): Promise<void> {
+    const normalizedBusinessId = businessId.trim();
+    const uniqueEmployeeIds = this.normalizeUniqueStrings(employeeIds);
+    if (normalizedBusinessId === "" || uniqueEmployeeIds.length === 0) return;
+
+    const CHUNK_SIZE = 30;
+    const chunks: string[][] = [];
+    for (let i = 0; i < uniqueEmployeeIds.length; i += CHUNK_SIZE) {
+      chunks.push(uniqueEmployeeIds.slice(i, i + CHUNK_SIZE));
+    }
+
+    const results = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<Metric>(COLLECTION_NAME, [
+          { field: "type", operator: "==", value: "EMPLOYEE" },
+          { field: "businessId", operator: "==", value: normalizedBusinessId },
+          { field: "employeeId", operator: "in", value: chunk },
+        ])
+      )
+    );
+
+    const metricsMap = new Map<string, Metric>();
+    results.flat().forEach((metric) => metricsMap.set(metric.id, metric));
+    await Promise.all(
+      Array.from(metricsMap.values()).map((metric) =>
+        FirestoreService.delete(COLLECTION_NAME, metric.id)
+      )
+    );
+  }
+
   async getMetricInsights(input: GetMetricInsightsInput): Promise<MetricInsightsResponse> {
     const entityId = this.resolveOptionalEntityId(input);
 
@@ -330,11 +363,11 @@ export class MetricService {
         deltas
       ),
       this.applyDeltaToMetricDocument(
-        { type: "EMPLOYEE", employeeId, date },
+        { type: "EMPLOYEE", businessId, employeeId, date },
         deltas
       ),
       this.applyDeltaToMetricDocument(
-        { type: "EMPLOYEE", employeeId, month },
+        { type: "EMPLOYEE", businessId, employeeId, month },
         deltas
       ),
     ]);
@@ -420,7 +453,6 @@ export class MetricService {
               employeeId: FieldValue.delete(),
             }
           : {
-              businessId: FieldValue.delete(),
               branchId: FieldValue.delete(),
             };
 
@@ -501,6 +533,15 @@ export class MetricService {
       { field: "type", operator: "==", value: input.entityType },
       { field: "timeFrame", operator: "==", value: timeframe },
       ...(entityId != null ? [{ field: entityField, operator: "==" as const, value: entityId }] : []),
+      ...(input.entityType === "EMPLOYEE" && input.businessId?.trim()
+        ? [
+            {
+              field: "businessId",
+              operator: "==" as const,
+              value: input.businessId.trim(),
+            },
+          ]
+        : []),
     ];
 
     const filters: DbFilters[] = [...baseFilters];
@@ -715,6 +756,12 @@ export class MetricService {
   private normalizeDelta(value: number | undefined): number {
     if (value == null || !Number.isFinite(value)) return 0;
     return value;
+  }
+
+  private normalizeUniqueStrings(values: string[]): string[] {
+    return Array.from(
+      new Set(values.map((value) => value.trim()).filter((value) => value !== ""))
+    );
   }
 
   private isZeroDelta(deltas: MetricDeltas): boolean {

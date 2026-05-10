@@ -276,7 +276,7 @@ export class ReviewService {
 
   async deleteReviewsByBranchId(
     branchId: string,
-    opts?: { skipBranchScoreUpdate?: boolean }
+    opts?: { skipBranchScoreUpdate?: boolean; skipEmployeeScoreUpdate?: boolean }
   ): Promise<void> {
     const normalizedBranchId = branchId.trim();
     if (normalizedBranchId === "") return;
@@ -287,13 +287,48 @@ export class ReviewService {
     await Promise.all(reviews.map((review) => this.deleteReviewWithData(review, opts)));
   }
 
+  async deleteEmployeeReviewsByBusinessAndTargetIds(
+    businessId: string,
+    targetIds: string[]
+  ): Promise<void> {
+    const normalizedBusinessId = businessId.trim();
+    const uniqueTargetIds = Array.from(
+      new Set(targetIds.map((targetId) => targetId.trim()).filter((targetId) => targetId !== ""))
+    );
+    if (normalizedBusinessId === "" || uniqueTargetIds.length === 0) return;
+
+    const CHUNK_SIZE = 30;
+    const chunks: string[][] = [];
+    for (let i = 0; i < uniqueTargetIds.length; i += CHUNK_SIZE) {
+      chunks.push(uniqueTargetIds.slice(i, i + CHUNK_SIZE));
+    }
+
+    const results = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<Review>(COLLECTION_NAME, [
+          { field: "businessId", operator: "==", value: normalizedBusinessId },
+          { field: "targetType", operator: "==", value: "EMPLOYEE" },
+          { field: "targetId", operator: "in", value: chunk },
+        ])
+      )
+    );
+
+    const reviewsMap = new Map<string, Review>();
+    results.flat().forEach((review) => reviewsMap.set(review.id, review));
+    await Promise.all(
+      Array.from(reviewsMap.values()).map((review) =>
+        this.deleteReviewWithData(review, { skipEmployeeScoreUpdate: true })
+      )
+    );
+  }
+
   private async deleteReviewWithData(
     review: Review,
-    opts?: { skipBranchScoreUpdate?: boolean }
+    opts?: { skipBranchScoreUpdate?: boolean; skipEmployeeScoreUpdate?: boolean }
   ): Promise<void> {
     await FirestoreService.delete(COLLECTION_NAME, review.id);
 
-    if (review.targetType === "EMPLOYEE") {
+    if (review.targetType === "EMPLOYEE" && opts?.skipEmployeeScoreUpdate !== true) {
       await this.decrementEmployeeMembershipScore(
         review.businessId,
         review.targetId,

@@ -12,6 +12,11 @@ import { ensureColombiaCountryCode } from "../../domain/utils/string.utils";
 import { logger } from "../../infrastructure/logger/logger";
 import FirestoreService from "./firestore.service";
 import { SchedulingIntegrityService } from "./scheduling-integrity.service";
+import {
+  isProtectedSuperAdminUserId,
+  isSuperAdminProtectedRole,
+} from "../../domain/constants/protected-role.constants";
+import type { Role } from "../../domain/interfaces/role.interface";
 
 const COLLECTION_NAME = "Users";
 const DELETED_USERS_COLLECTION = "DeletedUsers";
@@ -196,6 +201,15 @@ export class UserService {
       const user = await this.getByDocument(sanitizedDocument);
       if (!user) {
         throw CustomError.notFound("No existe un usuario con este número de documento");
+      }
+
+      if (isProtectedSuperAdminUserId(user.id)) {
+        const hasSuperAdminMembership = await this.hasActiveSuperAdminMembership(user);
+        if (hasSuperAdminMembership) {
+          throw CustomError.forbidden(
+            "No se puede eliminar al super administrador protegido."
+          );
+        }
       }
 
       await this.schedulingIntegrityService.ensureEmployeeCanBeDeleted([
@@ -429,4 +443,43 @@ export class UserService {
     );
   }
 
+  private async hasActiveSuperAdminMembership(user: User): Promise<boolean> {
+    const [membershipsByDocument, membershipsById] = await Promise.all([
+      FirestoreService.getAll<BusinessMembership>(BUSINESS_MEMBERSHIPS_COLLECTION, [
+        { field: "userId", operator: "==", value: user.document },
+        { field: "status", operator: "==", value: "ACTIVE" },
+      ]),
+      FirestoreService.getAll<BusinessMembership>(BUSINESS_MEMBERSHIPS_COLLECTION, [
+        { field: "userId", operator: "==", value: user.id },
+        { field: "status", operator: "==", value: "ACTIVE" },
+      ]),
+    ]);
+
+    const membershipsMap = new Map<string, BusinessMembership>();
+    membershipsByDocument.forEach((m) => membershipsMap.set(m.id, m));
+    membershipsById.forEach((m) => membershipsMap.set(m.id, m));
+
+    const roleIds = Array.from(
+      new Set(
+        Array.from(membershipsMap.values())
+          .map((m) => m.roleId?.trim() ?? "")
+          .filter((id) => id !== "")
+      )
+    );
+    if (roleIds.length === 0) return false;
+
+    const CHUNK_SIZE = 30;
+    const chunks: string[][] = [];
+    for (let i = 0; i < roleIds.length; i += CHUNK_SIZE) {
+      chunks.push(roleIds.slice(i, i + CHUNK_SIZE));
+    }
+    const roleResults = await Promise.all(
+      chunks.map((chunk) =>
+        FirestoreService.getAll<Role>("Roles", [
+          { field: "id", operator: "in", value: chunk },
+        ])
+      )
+    );
+    return roleResults.flat().some((role) => isSuperAdminProtectedRole(role));
+  }
 }
