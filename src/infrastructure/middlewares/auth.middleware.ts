@@ -17,13 +17,14 @@ function getFirebaseAuthErrorCode(error: unknown): string {
 
 export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   const path = req.originalUrl ?? req.path ?? "";
+  const isPublic = isPublicRequest(req.method, path);
+  const authHeader = req.headers.authorization;
 
-  if (isPublicRequest(req.method, path)) {
+  if (isPublic && (!authHeader || !authHeader.startsWith(BEARER_PREFIX))) {
     next();
     return;
   }
 
-  const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith(BEARER_PREFIX)) {
     logger.warn(
       `[authMiddleware] Token de sesión ausente o mal formado. path=${path}, method=${req.method}`
@@ -39,6 +40,11 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
 
   const idToken = authHeader.slice(BEARER_PREFIX.length).trim();
   if (!idToken) {
+    if (isPublic) {
+      next();
+      return;
+    }
+
     logger.warn(
       `[authMiddleware] Token de sesión vacío después de Bearer. path=${path}, method=${req.method}`
     );
@@ -63,6 +69,14 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
     })
     .catch((error: unknown) => {
       const code = getFirebaseAuthErrorCode(error);
+      if (isPublic) {
+        logger.warn(
+          `[authMiddleware] No fue posible usar el token opcional en ruta pública. code=${code || "unknown"}, path=${path}, method=${req.method}`
+        );
+        next();
+        return;
+      }
+
       if (code === "auth/user-not-found") {
         logger.warn(
           `[authMiddleware] Usuario inexistente en Firebase Auth para el token enviado. path=${path}, method=${req.method}`

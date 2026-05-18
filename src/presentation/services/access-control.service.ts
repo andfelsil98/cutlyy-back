@@ -193,6 +193,20 @@ export class AccessControlService {
     );
   }
 
+  async isMembershipOwnedByDocument(
+    document: string,
+    membership: BusinessMembership
+  ): Promise<boolean> {
+    const normalizedDocument = document.trim();
+    const membershipUserId = membership.userId?.trim() ?? "";
+    if (normalizedDocument === "" || membershipUserId === "") return false;
+
+    const user = await this.userService.getByDocument(normalizedDocument);
+    if (!user) return false;
+
+    return membershipUserId === user.document || membershipUserId === user.id;
+  }
+
   private async getMembershipsByUser(user: User): Promise<BusinessMembership[]> {
     const [membershipsByDocument, membershipsById] = await Promise.all([
       FirestoreService.getAll<BusinessMembership>(MEMBERSHIPS_COLLECTION, [

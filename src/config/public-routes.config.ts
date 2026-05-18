@@ -1,7 +1,7 @@
 /**
  * Prefijos de rutas que NO requieren token de sesión (rutas públicas).
  * Cualquier ruta cuyo path comience con alguno de estos prefijos se considera pública
- * y no se valida el header Authorization.
+ * y el header Authorization es opcional.
  * El resto de rutas exigen: Authorization: Bearer <idToken> (token de sesión Firebase).
  *
  * Ejemplo: si agregas "/health", entonces GET /health y GET /health/ready son públicas.

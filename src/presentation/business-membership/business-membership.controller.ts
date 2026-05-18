@@ -152,6 +152,80 @@ export class BusinessMembershipController {
     };
   }
 
+  private async requireMembershipListAccess(
+    req: Request,
+    input: {
+      id?: string;
+      userId?: string;
+      businessId?: string;
+    }
+  ) {
+    const requesterDocument = this.getRequesterDocument(req);
+
+    if (input.userId?.trim() === requesterDocument) {
+      return;
+    }
+
+    if (input.id != null) {
+      const membership = await this.businessMembershipService.getById(input.id);
+      const isSelfMembership =
+        await this.accessControlService.isMembershipOwnedByDocument(
+          requesterDocument,
+          membership
+        );
+      if (isSelfMembership) return;
+
+      const targetBusinessId = membership.businessId?.trim() ?? "";
+      if (targetBusinessId !== "") {
+        const businessIdHeader = req.businessId?.trim() ?? "";
+        if (businessIdHeader === targetBusinessId) {
+          await this.accessControlService.requireBusinessPermission(
+            requesterDocument,
+            targetBusinessId,
+            "core.users.list"
+          );
+          return;
+        }
+      }
+
+      await this.accessControlService.requireGlobalPermission(
+        requesterDocument,
+        "core.users.list"
+      );
+      return;
+    }
+
+    const targetBusinessId = input.businessId?.trim() ?? "";
+    if (targetBusinessId !== "") {
+      const businessIdHeader = req.businessId?.trim() ?? "";
+      if (businessIdHeader !== "") {
+        if (businessIdHeader !== targetBusinessId) {
+          throw CustomError.badRequest(
+            "El businessId del header no coincide con el negocio consultado."
+          );
+        }
+
+        await this.accessControlService.requireBusinessPermission(
+          requesterDocument,
+          targetBusinessId,
+          "core.users.list"
+        );
+        return;
+      }
+
+      await this.accessControlService.requireGlobalPermission(
+        requesterDocument,
+        "core.users.list"
+      );
+      return;
+    }
+
+    await this.accessControlService.requireGlobalPermission(
+      requesterDocument,
+      "core.users.list"
+    );
+  }
+
   public getAll = (req: Request, res: Response, next: NextFunction) => {
     const pageRaw =
       req.query.page != null ? Number(req.query.page) : DEFAULT_PAGE;
@@ -200,8 +274,14 @@ export class BusinessMembershipController {
       typeof expandRefsRaw === "string" &&
       expandRefsRaw.trim().toLowerCase() === "true";
 
-    this.businessMembershipService
-      .getAllMemberships({
+    const execute = async () => {
+      await this.requireMembershipListAccess(req, {
+        ...(id != null && { id }),
+        ...(userId != null && { userId }),
+        ...(businessId != null && { businessId }),
+      });
+
+      return this.businessMembershipService.getAllMemberships({
         page: pageRaw,
         pageSize,
         ...(id != null && { id }),
@@ -212,7 +292,10 @@ export class BusinessMembershipController {
         ...(roleId != null && { roleId }),
         ...(status != null && { status }),
         ...(expandRefs && { expandRefs: true }),
-      })
+      });
+    };
+
+    execute()
       .then((result) => {
         res.status(200).json(result);
       })
@@ -396,11 +479,20 @@ export class BusinessMembershipController {
           );
         }
 
-        await this.accessControlService.requireBusinessPermission(
-          requesterDocument,
-          targetBusinessId,
-          "core.memberships.create"
-        );
+        const canCreateActiveAdminMembership =
+          await this.businessMembershipService.canCreateActiveBusinessAdminMembership({
+            requesterDocument,
+            targetDocument: dto.document,
+            businessId: targetBusinessId,
+          });
+
+        if (!canCreateActiveAdminMembership) {
+          await this.accessControlService.requireBusinessPermission(
+            requesterDocument,
+            targetBusinessId,
+            "core.memberships.create"
+          );
+        }
       }
 
       return this.businessMembershipService.createPendingByDocument(dto, {

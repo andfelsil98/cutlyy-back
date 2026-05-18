@@ -51,13 +51,25 @@ export class PlanController {
       return;
     }
 
-    this.planService
-      .getAllPlans({
+    const isPublicLookup = id != null;
+    const execute = async () => {
+      if (!isPublicLookup) {
+        const document = this.getRequesterDocument(req);
+        await this.accessControlService.requireGlobalPermission(
+          document,
+          "core.plan.list"
+        );
+      }
+
+      return this.planService.getAllPlans({
         page: pageRaw,
         pageSize,
         ...(id != null && { id }),
         ...(statusRaw != null && { status: statusRaw }),
-      })
+      });
+    };
+
+    execute()
       .then((result) => {
         res.status(200).json(result);
       })

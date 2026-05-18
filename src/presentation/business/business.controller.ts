@@ -38,14 +38,28 @@ export class BusinessController {
       req.query.consecutivePrefix.trim() !== ""
         ? normalizeConsecutivePrefix(req.query.consecutivePrefix)
         : undefined;
-    this.businessService
-      .getAllBusinesses({
+    const isPublicLookup =
+      id != null || slug != null || consecutivePrefix != null;
+
+    const execute = async () => {
+      if (!isPublicLookup) {
+        const requesterDocument = this.getRequesterDocument(req);
+        await this.accessControlService.requireGlobalPermission(
+          requesterDocument,
+          "core.bussinesses.list"
+        );
+      }
+
+      return this.businessService.getAllBusinesses({
         page: pageRaw,
         pageSize,
         ...(id != null && { id }),
         ...(slug != null && { slug }),
         ...(consecutivePrefix != null && { consecutivePrefix }),
-      })
+      });
+    };
+
+    execute()
       .then((result) => {
         res.status(200).json(result);
       })
@@ -184,4 +198,15 @@ export class BusinessController {
       })
       .catch(next);
   };
+
+  private getRequesterDocument(req: Request): string {
+    const documentClaimRaw = req.decodedIdToken?.["document"];
+    if (typeof documentClaimRaw !== "string" || documentClaimRaw.trim() === "") {
+      throw CustomError.unauthorized(
+        "Token de sesión inválido: claim document no presente en el token."
+      );
+    }
+
+    return documentClaimRaw.trim();
+  }
 }

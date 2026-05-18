@@ -56,6 +56,13 @@ export interface CreatePendingMembershipByDocumentOptions {
   requesterDocument?: string;
 }
 
+export interface ActiveBusinessAdminMembershipCreationInput {
+  requesterDocument: string;
+  targetDocument: string;
+  businessId: string;
+  targetUser?: User | null;
+}
+
 export type BusinessMembershipWithRelations = Omit<
   BusinessMembership,
   "roleId" | "userId"
@@ -390,6 +397,24 @@ export class BusinessMembershipService {
     }
   }
 
+  async canCreateActiveBusinessAdminMembership(
+    input: ActiveBusinessAdminMembershipCreationInput
+  ): Promise<boolean> {
+    const requesterDocument = input.requesterDocument.trim();
+    const targetDocument = input.targetDocument.trim();
+    const businessId = input.businessId.trim();
+    if (requesterDocument === "" || targetDocument === "" || businessId === "") {
+      return false;
+    }
+    if (requesterDocument !== targetDocument) return false;
+
+    const user = input.targetUser ?? (await this.findUserByDocument(targetDocument));
+    if (!user) return false;
+    if (user.document.trim() !== requesterDocument) return false;
+
+    return await this.isRequesterGlobalSuperAdmin(requesterDocument);
+  }
+
   async createPendingByDocument(
     data: CreatePendingMembershipByDocumentData,
     opts: CreatePendingMembershipByDocumentOptions = {}
@@ -436,16 +461,18 @@ export class BusinessMembershipService {
           );
         }
 
-        const canRecoverOrphanedBusiness =
-          requesterDocument !== "" &&
-          user.document.trim() === requesterDocument &&
-          (await this.isRequesterGlobalSuperAdmin(requesterDocument)) &&
-          (await this.isBusinessOrphaned(businessId));
-        const adminRole = canRecoverOrphanedBusiness
+        const canCreateActiveAdminMembership =
+          await this.canCreateActiveBusinessAdminMembership({
+            requesterDocument,
+            targetDocument: document,
+            businessId,
+            targetUser: user,
+          });
+        const adminRole = canCreateActiveAdminMembership
           ? await this.resolveProtectedAdminRole()
           : null;
         const nextRoleId = adminRole?.id ?? null;
-        const nextStatus = canRecoverOrphanedBusiness
+        const nextStatus = canCreateActiveAdminMembership
           ? ("ACTIVE" as const)
           : ("PENDING" as const);
         const reusableMembership = existingMemberships[0] ?? null;
@@ -1027,26 +1054,6 @@ export class BusinessMembershipService {
     throw CustomError.internalServerError(
       "No se pudo resolver el rol administrador estándar"
     );
-  }
-
-  private async isBusinessOrphaned(businessId: string): Promise<boolean> {
-    const activeMemberships = await FirestoreService.getAll<BusinessMembership>(
-      COLLECTION_NAME,
-      [
-        { field: "businessId", operator: "==", value: businessId },
-        { field: "status", operator: "==", value: "ACTIVE" },
-      ]
-    );
-
-    for (const membership of activeMemberships) {
-      const roleId = membership.roleId?.trim() ?? "";
-      if (roleId === "") continue;
-
-      const role = await this.getRoleById(roleId);
-      if (isAdminProtectedRole(role)) return false;
-    }
-
-    return true;
   }
 
   private async isRequesterGlobalSuperAdmin(
